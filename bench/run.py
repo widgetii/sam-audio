@@ -65,9 +65,10 @@ def timed_separate(model, batch, candidates, max_chunk_tokens=None):
     return result, t1 - t0
 
 
-def benchmark_model(model_name: str, audio: torch.Tensor):
+def benchmark_model(model_name: str, audio: torch.Tensor, text_only: bool = False):
+    suffix = " [text_only]" if text_only else ""
     print(f"\n{'=' * 60}")
-    print(f"Model: {model_name}")
+    print(f"Model: {model_name}{suffix}")
     print(f"{'=' * 60}")
 
     torch.cuda.reset_peak_memory_stats()
@@ -75,7 +76,8 @@ def benchmark_model(model_name: str, audio: torch.Tensor):
 
     # Load model + processor
     t0 = time.perf_counter()
-    model = SAMAudio.from_pretrained(model_name).eval().to(DEVICE)
+    model_kwargs = {"text_only": True} if text_only else {}
+    model = SAMAudio.from_pretrained(model_name, **model_kwargs).eval().to(DEVICE)
     processor = SAMAudioProcessor.from_pretrained(model_name)
     torch.cuda.synchronize()
     load_time = time.perf_counter() - t0
@@ -85,20 +87,18 @@ def benchmark_model(model_name: str, audio: torch.Tensor):
     batch = processor(descriptions=[PROMPT], audios=[audio])
     batch = batch.to(DEVICE)
 
+    candidates = 1 if text_only else RERANKING_CANDIDATES
+
     # Warm-up run (discarded)
     print("  Warm-up run...")
     torch.cuda.reset_peak_memory_stats()
-    result, warmup_time = timed_separate(
-        model, batch, RERANKING_CANDIDATES, MAX_CHUNK_TOKENS
-    )
+    result, warmup_time = timed_separate(model, batch, candidates, MAX_CHUNK_TOKENS)
     print(f"  Warm-up time: {warmup_time:.2f}s")
 
     # Timed runs
     times = []
     for i in range(NUM_TIMED_RUNS):
-        _, elapsed = timed_separate(
-            model, batch, RERANKING_CANDIDATES, MAX_CHUNK_TOKENS
-        )
+        _, elapsed = timed_separate(model, batch, candidates, MAX_CHUNK_TOKENS)
         times.append(elapsed)
         print(f"  Run {i + 1}: {elapsed:.2f}s")
 
@@ -115,6 +115,7 @@ def benchmark_model(model_name: str, audio: torch.Tensor):
 
     record = {
         "model": model_name,
+        "text_only": text_only,
         "load_time_s": round(load_time, 3),
         "warmup_time_s": round(warmup_time, 3),
         "inference_mean_s": round(mean_time, 3),
@@ -230,6 +231,8 @@ def print_summary_table(records):
 
     for r in records:
         short_name = r["model"].replace("facebook/sam-audio-", "")
+        if r.get("text_only"):
+            short_name += " [text_only]"
         if "error" in r:
             print(f"{short_name:<30}   {'OOM':>50}")
             continue
@@ -271,6 +274,25 @@ def main():
             print(f"  OOM: {e}")
             torch.cuda.empty_cache()
             records.append({"model": model_name, "error": "OOM"})
+            target_wavs.append(None)
+            input_wavs.append(None)
+
+    # Low-VRAM benchmark: text_only mode (targets 16GB GPUs)
+    print(f"\n{'#' * 60}")
+    print("LOW-VRAM BENCHMARK (text_only=True, candidates=1, BF16)")
+    print(f"{'#' * 60}")
+    for model_name in ["facebook/sam-audio-small"]:
+        try:
+            record, target_wav, input_wav = benchmark_model(
+                model_name, audio, text_only=True
+            )
+            records.append(record)
+            target_wavs.append(target_wav)
+            input_wavs.append(input_wav)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  OOM: {e}")
+            torch.cuda.empty_cache()
+            records.append({"model": model_name, "text_only": True, "error": "OOM"})
             target_wavs.append(None)
             input_wavs.append(None)
 

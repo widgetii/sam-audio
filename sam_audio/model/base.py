@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
 
+import inspect
 import json
 import os
 from typing import Callable, Dict, Optional, Union
@@ -43,8 +44,9 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
         with open(os.path.join(cached_model_dir, "config.json")) as fin:
             config = json.load(fin)
 
+        valid_params = set(inspect.signature(cls.config_cls.__init__).parameters)
         for key, value in model_kwargs.items():
-            if key in config:
+            if key in config or key in valid_params:
                 config[key] = value
 
         config = cls.config_cls(**config)

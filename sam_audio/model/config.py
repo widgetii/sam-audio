@@ -214,6 +214,7 @@ class SAMAudioConfig:
         visual_ranker=None,
         text_ranker=None,
         span_predictor: Optional[str] = "pe-a-frame-large",
+        text_only: bool = False,
     ):
         self.in_channels = in_channels
         self.audio_codec = DACVAEConfig(**(audio_codec or {}))
@@ -229,6 +230,7 @@ class SAMAudioConfig:
             None if text_ranker is None else parse_ranker_config(text_ranker)
         )
         self.span_predictor = span_predictor
+        self.text_only = text_only
 
 
 class SAMAudioJudgeConfig:

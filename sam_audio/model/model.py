@@ -78,28 +78,39 @@ class SAMAudio(BaseModel):
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
+        self._text_only = cfg.text_only
         self.audio_codec = DACVAE(cfg.audio_codec)
         self.text_encoder = T5TextEncoder(cfg.text_encoder)
-        self.vision_encoder = PerceptionEncoder(cfg.vision_encoder)
         self.transformer = DiT(cfg.transformer)
         self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
-        self.align_masked_video = AlignModalities(
-            cfg.vision_encoder.dim, cfg.transformer.dim
-        )
         self.embed_anchors = EmbedAnchors(
             cfg.num_anchors, cfg.anchor_embedding_dim, cfg.transformer.dim
         )
         self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
-        self.visual_ranker = create_ranker(cfg.visual_ranker)
-        self.text_ranker = create_ranker(cfg.text_ranker)
-        if cfg.span_predictor is not None:
-            self.span_predictor = PEAudioFrame.from_config(
-                cfg.span_predictor, pretrained=True
+
+        if cfg.text_only:
+            self._vision_encoder_dim = cfg.vision_encoder.dim
+            self.align_masked_video = AlignModalities(
+                cfg.vision_encoder.dim, cfg.transformer.dim
             )
-            self.span_predictor_transform = PEAudioFrameTransform.from_config(
-                cfg.span_predictor
+            self.visual_ranker = None
+            self.text_ranker = None
+        else:
+            self._vision_encoder_dim = cfg.vision_encoder.dim
+            self.vision_encoder = PerceptionEncoder(cfg.vision_encoder)
+            self.align_masked_video = AlignModalities(
+                cfg.vision_encoder.dim, cfg.transformer.dim
             )
+            self.visual_ranker = create_ranker(cfg.visual_ranker)
+            self.text_ranker = create_ranker(cfg.text_ranker)
+            if cfg.span_predictor is not None:
+                self.span_predictor = PEAudioFrame.from_config(
+                    cfg.span_predictor, pretrained=True
+                )
+                self.span_predictor_transform = PEAudioFrameTransform.from_config(
+                    cfg.span_predictor
+                )
 
     @property
     def sample_rate(self):
@@ -185,8 +196,8 @@ class SAMAudio(BaseModel):
 
     def _get_video_features(self, video, audio_features):
         B, T, _ = audio_features.shape
-        if video is None:
-            return audio_features.new_zeros(B, self.vision_encoder.dim, T)
+        if video is None or self._text_only:
+            return audio_features.new_zeros(B, self._vision_encoder_dim, T)
         else:
             return self.vision_encoder(video).transpose(1, 2)
 
@@ -208,6 +219,9 @@ class SAMAudio(BaseModel):
     def _get_forward_args(self, batch: Batch, candidates: int = 1):
         audio_features = self._get_audio_features(batch.audios)
         text_features, text_mask = self.text_encoder(batch.descriptions)
+        if self._text_only:
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
         masked_video_features = self._get_video_features(
             batch.masked_video, audio_features
         )
@@ -349,13 +363,20 @@ class SAMAudio(BaseModel):
 
     def load_state_dict(self, state_dict, strict=True):
         if strict:
+            if self._text_only:
+                state_dict = {
+                    k: v
+                    for k, v in state_dict.items()
+                    if not k.startswith("vision_encoder.")
+                }
             missing_keys, unexpected_keys = super().load_state_dict(
                 state_dict, strict=False
             )
             # We load this directly from HF, not in checkpoint
-            skip_regex = re.compile(
-                "(^text_encoder|^visual_ranker|^text_ranker|^span_predictor)"
-            )
+            skip_pattern = "^text_encoder|^visual_ranker|^text_ranker|^span_predictor"
+            if self._text_only:
+                skip_pattern += "|^vision_encoder"
+            skip_regex = re.compile(f"({skip_pattern})")
             missing_keys = [x for x in missing_keys if not re.search(skip_regex, x)]
             if len(missing_keys) > 0 or len(unexpected_keys) > 0:
                 raise RuntimeError(
