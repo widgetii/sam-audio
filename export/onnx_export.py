@@ -160,6 +160,8 @@ def export_dit_forward(model: SAMAudio, output_dir: Path, device: str = "cpu"):
     audio_pad_mask = torch.ones(B, T, dtype=torch.bool, device=device)
 
     output_path = output_dir / "dit_forward.onnx"
+    # Use legacy TorchScript exporter — the dynamo exporter can't handle
+    # dynamic padding in Patcher's Conv1d and RotaryEmbedding slicing
     torch.onnx.export(
         wrapper,
         (
@@ -173,6 +175,7 @@ def export_dit_forward(model: SAMAudio, output_dir: Path, device: str = "cpu"):
         ),
         str(output_path),
         opset_version=18,
+        dynamo=False,
         input_names=[
             "noisy_audio",
             "audio_features",
@@ -225,6 +228,7 @@ def export_dacvae(model: SAMAudio, output_dir: Path, device: str = "cpu"):
             (waveform,),
             str(encoder_path),
             opset_version=18,
+            dynamo=False,
             input_names=["waveform"],
             output_names=["features"],
             dynamic_axes={
@@ -247,6 +251,7 @@ def export_dacvae(model: SAMAudio, output_dir: Path, device: str = "cpu"):
             (features,),
             str(decoder_path),
             opset_version=18,
+            dynamo=False,
             input_names=["features"],
             output_names=["waveform"],
             dynamic_axes={
