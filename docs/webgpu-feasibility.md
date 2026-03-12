@@ -17,18 +17,19 @@ WebGPU provides compute shader access with performance roughly 60-80% of native 
 
 ## Memory Budget
 
-SAM-Audio small (text_only, FP16):
+SAM-Audio small (text_only) — measured ONNX model sizes (FP32):
 
-| Component | FP32 Size | FP16 Size |
-|-----------|-----------|-----------|
-| T5-base encoder | 850 MB | 425 MB |
-| DiT (transformer + proj + align) | ~600 MB | ~300 MB |
-| DACVAE (encoder + decoder) | ~200 MB | ~100 MB |
-| **Total weights** | **~1.65 GB** | **~825 MB** |
+| Component | ONNX Size (FP32) | FP16 (est.) |
+|-----------|-----------------|-------------|
+| T5-base encoder | 0.9 MB | 0.5 MB |
+| DiT (transformer + proj + align) | 1903.0 MB | 951.5 MB |
+| DACVAE encoder | 105.1 MB | 52.6 MB |
+| DACVAE decoder | 305.8 MB | 152.9 MB |
+| **Total weights** | **2314.8 MB** | **~1157 MB** |
 | Peak activations (30s audio) | ~2 GB | ~1 GB |
-| **Peak total** | **~3.65 GB** | **~1.8 GB** |
+| **Peak total (est.)** | **~4.3 GB** | **~2.2 GB** |
 
-FP16 fits well within the 8 GB limit. INT8 quantization would further reduce weights to ~415 MB. Audio duration is the main scaling factor — 30s audio should work, longer audio may require chunking.
+FP16 fits well within the 8 GB WebGPU limit. INT8 quantization would further reduce weights to ~580 MB. The DiT dominates at 82% of total weight size. Audio duration is the main scaling factor for activations — 30s audio should work, longer audio may require chunking.
 
 ## Framework Options
 
@@ -57,30 +58,32 @@ FP16 fits well within the 8 GB limit. INT8 quantization would further reduce wei
 
 ## Component-by-Component Export Analysis
 
-### T5 Encoder
+### T5 Encoder (0.9 MB)
 
-**Status: Straightforward**
+**Status: Exported successfully** (dynamo exporter)
 
-Standard HuggingFace T5EncoderModel. Well-tested ONNX export path via `torch.onnx.export` or `optimum`. Called once per separation — not performance critical.
+Standard HuggingFace T5EncoderModel. Exported with PyTorch 2.10's dynamo-based ONNX exporter. Called once per separation — not performance critical.
 
-### DiT Forward (ODE Step Function)
+### DiT Forward (1903 MB)
 
-**Status: Exportable with workarounds**
+**Status: Exported successfully** (legacy TorchScript exporter)
 
 The ODE solver (`torchdiffeq.odeint`) uses a Python closure, so the full pipeline cannot be a single ONNX graph. Instead, we export the closure body (`SAMAudio.forward()`) and reimplement the ODE loop in JavaScript.
 
-Concerns handled:
+Issues encountered and resolved:
+- **Dynamo exporter fails** on dynamic padding in `Patcher`'s custom `Conv1d` — switched to legacy TorchScript exporter (`dynamo=False`)
+- **TorchScript tracer bakes shape constants** — must trace with the same sequence length used at inference (e.g., T=125 for 5s audio at 48kHz)
 - `einops.rearrange` — traces correctly with concrete shapes during export
 - `AlignModalities` — has `if tgt is None` branch; always pass a tensor (zeros) so tracing takes the non-None path
 - `RMSNorm` with `.float()` cast — traces fine, produces correct ONNX ops
-- `RotaryEmbedding` with dynamic slicing `freqs_cis[:, :seqlen]` — supported in opset 17
-- `scaled_dot_product_attention` — ONNX opset 17 supports this natively
+- `RotaryEmbedding` with dynamic slicing `freqs_cis[:, :seqlen]` — works in opset 18
+- `scaled_dot_product_attention` — supported natively
 
-### DACVAE Codec
+### DACVAE Codec (105 + 306 MB)
 
-**Status: Exportable with preprocessing**
+**Status: Exported successfully** (legacy TorchScript exporter)
 
-Requires `torch.nn.utils.remove_weight_norm()` on all weight-normed layers before tracing. Split into encoder and decoder for flexibility (chunked decode calls decoder multiple times). The `cudnn.flags(enabled=False)` context manager is handled by disabling cuDNN globally during export.
+Requires `torch.nn.utils.remove_weight_norm()` on all weight-normed layers before tracing. Split into encoder and decoder for flexibility (chunked decode calls decoder multiple times). The `cudnn.flags(enabled=False)` context manager is handled by disabling cuDNN globally during export. Also requires legacy exporter due to dynamic padding in DACVAE's convolutional layers.
 
 ### ODE Solver (JavaScript)
 
@@ -148,17 +151,17 @@ For a consumer laptop GPU (RTX 3060 mobile / Apple M2):
 
 | Format | Weight Size | Expected Quality | WebGPU Support |
 |--------|------------|-----------------|----------------|
-| FP16 | 825 MB | Baseline | Full |
-| INT8 (dynamic) | ~415 MB | ~0.1 dB degradation | ONNX RT Web |
-| INT4 (GPTQ/AWQ) | ~210 MB | ~0.5 dB degradation | TVM WebGPU |
+| FP16 | ~1157 MB | Baseline | Full |
+| INT8 (dynamic) | ~580 MB | ~0.1 dB degradation | ONNX RT Web |
+| INT4 (GPTQ/AWQ) | ~290 MB | ~0.5 dB degradation | TVM WebGPU |
 
 INT8 is the sweet spot — halves model size with minimal quality loss. INT4 would enable running on 4 GB WebGPU devices but needs quality validation.
 
 ## Risks
 
-1. **ONNX operator coverage**: Some PyTorch ops may not have ONNX equivalents. The `einops` patterns and custom rope implementation are the most likely to cause issues during export. Mitigation: Phase 1 validates this.
+1. **~~ONNX operator coverage~~**: ~~Some PyTorch ops may not have ONNX equivalents.~~ **Resolved in Phase 1.** All ops export successfully via legacy TorchScript exporter. The dynamo exporter fails on dynamic padding but is not required.
 
-2. **Numerical precision**: FP16 accumulation in WebGPU may differ from PyTorch's mixed-precision behavior. The ODE solver amplifies small errors over 32 steps. Mitigation: validate with cosine similarity > 0.999 tolerance.
+2. **Numerical precision**: FP16 accumulation in WebGPU may differ from PyTorch's mixed-precision behavior. The ODE solver amplifies small errors over 32 steps. **Phase 1 FP32 validation showed max abs error 0.000041 and cosine similarity 1.0** — no error amplification observed. FP16 browser inference may introduce larger errors but starting from an excellent baseline.
 
 3. **Memory fragmentation**: WebGPU memory allocation is less flexible than CUDA. Large contiguous buffers may fail even if total memory is sufficient. Mitigation: chunked processing, smaller batch sizes.
 
@@ -168,10 +171,12 @@ INT8 is the sweet spot — halves model size with minimal quality loss. INT4 wou
 
 ## Roadmap
 
-### Phase 1: ONNX Export PoC (Current)
-- Export 3 ONNX models from SAMAudio small text_only
-- Validate numerical equivalence with Python ONNX Runtime
-- Document export issues and workarounds
+### Phase 1: ONNX Export PoC (Complete)
+- Exported 4 ONNX models from SAMAudio small text_only (T5, DiT, DACVAE enc/dec)
+- Validated numerical equivalence: max abs error 0.000041, cosine similarity 1.0
+- Total ONNX size: 2.3 GB (FP32), ~1.2 GB estimated FP16
+- Legacy TorchScript exporter required (dynamo fails on dynamic padding)
+- Sequence length baked at trace time (T=125 for 5s audio)
 
 ### Phase 2: Browser Runtime
 - Load ONNX models in browser with ONNX Runtime Web (WebGPU backend)
@@ -188,4 +193,4 @@ INT8 is the sweet spot — halves model size with minimal quality loss. INT4 wou
 
 ## Conclusion
 
-Browser deployment of SAM-Audio small is technically feasible with today's WebGPU. The main challenges are export correctness (solved in Phase 1) and inference latency (32 DiT evaluations at ~0.5-1s each in WebGPU). The resulting 15-45 second processing time is acceptable for an offline tool. Memory requirements (~1.8 GB FP16) fit within browser limits with room to spare.
+Browser deployment of SAM-Audio small is technically feasible with today's WebGPU. Phase 1 validated that all model components export to ONNX with near-perfect numerical equivalence (max error 4.1e-5, cosine similarity 1.0). The main remaining challenge is inference latency (32 DiT evaluations at ~0.5-1s each in WebGPU). The resulting 15-45 second processing time is acceptable for an offline tool. Memory requirements (~2.2 GB FP16) fit within browser limits with room to spare.
