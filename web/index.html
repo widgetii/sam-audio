@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAM-Audio: Sound Separation in Browser</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1117; color: #e1e4e8; max-width: 720px; margin: 0 auto;
+    padding: 24px 16px;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; margin-bottom: 24px; font-size: 0.9rem; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .section h2 { font-size: 1rem; margin-bottom: 12px; color: #c9d1d9; }
+  label { display: block; font-size: 0.85rem; color: #8b949e; margin-bottom: 4px; }
+  input[type="text"], input[type="file"], select {
+    width: 100%; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 6px; color: #e1e4e8; font-size: 0.9rem; margin-bottom: 12px;
+  }
+  input[type="file"] { padding: 6px; }
+  button {
+    background: #238636; color: #fff; border: none; padding: 10px 20px;
+    border-radius: 6px; font-size: 0.9rem; cursor: pointer; width: 100%;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+  .progress-bar {
+    width: 100%; height: 6px; background: #21262d; border-radius: 3px;
+    margin: 8px 0; overflow: hidden;
+  }
+  .progress-bar .fill { height: 100%; background: #58a6ff; transition: width 0.3s; width: 0%; }
+  #log {
+    font-family: "SF Mono", "Fira Code", monospace; font-size: 0.8rem;
+    color: #8b949e; max-height: 200px; overflow-y: auto; white-space: pre-wrap;
+    line-height: 1.5;
+  }
+  .audio-row { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
+  .audio-row label { margin: 0; min-width: 60px; }
+  audio { flex: 1; height: 36px; }
+  .hidden { display: none; }
+  .status { color: #58a6ff; font-size: 0.85rem; margin: 8px 0; }
+  .error { color: #f85149; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+
+<h1>SAM-Audio</h1>
+<p class="subtitle">Separate sounds from audio using text prompts. Runs entirely in your browser via WebGPU.</p>
+
+<div class="section">
+  <h2>1. Load Models</h2>
+  <label for="model-url">Model URL (directory containing ONNX files)</label>
+  <input type="text" id="model-url" value="/models/" placeholder="e.g. /models/ or https://...">
+  <button id="btn-load" onclick="loadModels()">Load Models</button>
+  <div class="progress-bar"><div class="fill" id="load-progress"></div></div>
+  <div id="load-status" class="status"></div>
+</div>
+
+<div class="section">
+  <h2>2. Input</h2>
+  <label for="audio-file">Audio file (WAV, MP3, FLAC — will be resampled to 48kHz)</label>
+  <input type="file" id="audio-file" accept="audio/*">
+  <div class="audio-row hidden" id="input-preview-row">
+    <label>Input:</label>
+    <audio id="input-preview" controls></audio>
+  </div>
+  <label for="text-prompt" style="margin-top: 8px;">Text prompt (describe the sound to extract)</label>
+  <input type="text" id="text-prompt" value="a dog barking" placeholder="e.g. speech, piano, birds singing">
+</div>
+
+<div class="section">
+  <h2>3. Separate</h2>
+  <button id="btn-separate" onclick="separate()" disabled>Separate Audio</button>
+  <div class="progress-bar"><div class="fill" id="sep-progress"></div></div>
+  <div id="sep-status" class="status"></div>
+</div>
+
+<div class="section hidden" id="results-section">
+  <h2>Results</h2>
+  <div class="audio-row">
+    <label>Target:</label>
+    <audio id="audio-target" controls></audio>
+  </div>
+  <div class="audio-row">
+    <label>Residual:</label>
+    <audio id="audio-residual" controls></audio>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Log</h2>
+  <div id="log"></div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
