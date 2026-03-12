@@ -3,76 +3,66 @@
 """Quantize ONNX models to FP16 for browser deployment.
 
 Converts FP32 ONNX models to FP16, roughly halving model size.
-Also merges external data files into single ONNX files for easier serving.
+Handles large models (>2GB) via ONNX external data format.
 
 Usage:
-    uv run python export/quantize.py [--input-dir export/onnx_models] [--output-dir export/onnx_models_fp16]
+    uv run python export/quantize.py [--input-dir export/onnx_models] [--output-dir export/onnx_models_web]
 """
 
 import argparse
 from pathlib import Path
 
 import onnx
-from onnxruntime.quantization import quantize_dynamic
-from onnxruntime.quantization.shape_inference import quant_pre_process
+from onnx import numpy_helper
 
 
-def convert_to_fp16(input_path: Path, output_path: Path):
+def convert_to_fp16(input_path: Path, output_path: Path, load_external=False):
     """Convert ONNX model from FP32 to FP16."""
     print(f"  Loading {input_path.name}...")
-    model = onnx.load(str(input_path))
+    model = onnx.load(str(input_path), load_external_data=load_external)
 
-    from onnx import numpy_helper
-
+    total_params = 0
+    converted_params = 0
     for initializer in model.graph.initializer:
         if initializer.data_type == onnx.TensorProto.FLOAT:
             data = numpy_helper.to_array(initializer)
+            total_params += data.size
             data_fp16 = data.astype("float16")
             new_init = numpy_helper.from_array(data_fp16, name=initializer.name)
             initializer.CopyFrom(new_init)
+            converted_params += data.size
 
-    onnx.save(model, str(output_path))
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"  -> {output_path} ({size_mb:.1f} MB)")
+    print(f"  Converted {converted_params:,} / {total_params:,} FP32 params to FP16")
 
+    # Estimate output size to decide on external data
+    est_size_mb = sum(
+        numpy_helper.to_array(init).nbytes for init in model.graph.initializer
+    ) / (1024 * 1024)
 
-def quantize_int8(input_path: Path, output_path: Path):
-    """Quantize ONNX model to INT8 (dynamic quantization)."""
-    print(f"  Preprocessing {input_path.name} for quantization...")
-    preprocessed = input_path.parent / f"{input_path.stem}_preprocessed.onnx"
-
-    try:
-        quant_pre_process(str(input_path), str(preprocessed))
-    except Exception as e:
-        print(f"  Warning: preprocessing failed ({e}), using original model")
-        preprocessed = input_path
-
-    print("  Quantizing to INT8...")
-    quantize_dynamic(str(preprocessed), str(output_path))
-
-    # Clean up preprocessed file
-    if preprocessed != input_path and preprocessed.exists():
-        preprocessed.unlink()
-
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"  -> {output_path} ({size_mb:.1f} MB)")
-
-
-def merge_external_data(input_path: Path, output_path: Path):
-    """Load ONNX model with external data and save as single file."""
-    print(f"  Merging external data for {input_path.name}...")
-    model = onnx.load(str(input_path), load_external_data=True)
-    onnx.save(
-        model,
-        str(output_path),
-        save_as_external_data=False,
-    )
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"  -> {output_path} ({size_mb:.1f} MB)")
+    if est_size_mb > 1800:
+        # Save with external data for large models (protobuf 2GB limit)
+        data_path = output_path.name + ".data"
+        print(f"  Saving with external data ({data_path})...")
+        onnx.save(
+            model,
+            str(output_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_path,
+        )
+        data_file = output_path.parent / data_path
+        total_mb = (output_path.stat().st_size + data_file.stat().st_size) / (
+            1024 * 1024
+        )
+        print(f"  -> {output_path} + {data_path} ({total_mb:.1f} MB total)")
+    else:
+        onnx.save(model, str(output_path))
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        print(f"  -> {output_path} ({size_mb:.1f} MB)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Quantize ONNX models")
+    parser = argparse.ArgumentParser(description="Quantize ONNX models to FP16")
     parser.add_argument(
         "--input-dir",
         type=str,
@@ -83,13 +73,7 @@ def main():
         "--output-dir",
         type=str,
         default="export/onnx_models_web",
-        help="Output directory for quantized models",
-    )
-    parser.add_argument(
-        "--dit-format",
-        choices=["fp16", "int8"],
-        default="fp16",
-        help="Quantization format for DiT (largest model)",
+        help="Output directory for FP16 models",
     )
     args = parser.parse_args()
 
@@ -97,14 +81,15 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    models = {
-        "t5_encoder": input_dir / "t5_encoder.onnx",
-        "dit_forward": input_dir / "dit_forward.onnx",
-        "dacvae_encoder": input_dir / "dacvae_encoder.onnx",
-        "dacvae_decoder": input_dir / "dacvae_decoder.onnx",
-    }
+    models = [
+        "t5_encoder",
+        "dit_forward",
+        "dacvae_encoder",
+        "dacvae_decoder",
+    ]
 
-    for name, path in models.items():
+    for name in models:
+        path = input_dir / f"{name}.onnx"
         if not path.exists():
             print(f"Skipping {name}: {path} not found")
             continue
@@ -112,22 +97,9 @@ def main():
         print(f"\nProcessing {name}:")
         out_path = output_dir / f"{name}.onnx"
 
-        # T5 uses external data files — merge first
-        external_data = path.parent / f"{path.name}.data"
-        if external_data.exists():
-            merged = output_dir / f"{name}_merged.onnx"
-            merge_external_data(path, merged)
-            path = merged
-
-        if name == "dit_forward" and args.dit_format == "int8":
-            quantize_int8(path, out_path)
-        else:
-            convert_to_fp16(path, out_path)
-
-        # Clean up merged temp file
-        merged_path = output_dir / f"{name}_merged.onnx"
-        if merged_path.exists() and merged_path != out_path:
-            merged_path.unlink()
+        # Check for external data (T5 dynamo exporter creates .onnx.data files)
+        has_external = (path.parent / f"{path.name}.data").exists()
+        convert_to_fp16(path, out_path, load_external=has_external)
 
     # Copy tokenizer
     tokenizer_src = input_dir / "t5_tokenizer"
@@ -140,8 +112,9 @@ def main():
 
     print("\nQuantization complete!")
     print(f"Output directory: {output_dir}")
-    total_size = sum(f.stat().st_size for f in output_dir.glob("*.onnx"))
-    print(f"Total ONNX size: {total_size / (1024 * 1024):.1f} MB")
+
+    total_size = sum(f.stat().st_size for f in output_dir.rglob("*") if f.is_file())
+    print(f"Total size: {total_size / (1024 * 1024):.1f} MB")
 
 
 if __name__ == "__main__":

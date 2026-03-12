@@ -30,8 +30,7 @@ function log(msg) {
 
 // --- Model Loading ---
 
-async function createSession(url, name, progressCb) {
-  log(`Loading ${name}...`);
+async function fetchWithProgress(url, progressCb) {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
   const total = parseInt(resp.headers.get("content-length") || "0", 10);
@@ -51,17 +50,45 @@ async function createSession(url, name, progressCb) {
     buf.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return { buffer: buf.buffer, bytes: loaded };
+}
+
+async function createSession(url, name, progressCb) {
+  log(`Loading ${name}...`);
+
+  // Check if external data file exists alongside the ONNX file
+  const dataUrl = url + ".data";
+  let externalData = null;
+  try {
+    const headResp = await fetch(dataUrl, { method: "HEAD" });
+    if (headResp.ok) {
+      log(`  Loading external data for ${name}...`);
+      const { buffer, bytes } = await fetchWithProgress(dataUrl, progressCb);
+      externalData = buffer;
+      log(`  External data: ${(bytes / 1024 / 1024).toFixed(1)} MB`);
+    }
+  } catch {
+    // No external data file — that's fine
+  }
+
+  const { buffer: modelBuffer, bytes: modelBytes } = await fetchWithProgress(url, progressCb);
 
   const providers = [];
-  if (ort.env.webgpu && typeof navigator !== "undefined" && navigator.gpu) {
+  if (typeof navigator !== "undefined" && navigator.gpu) {
     providers.push("webgpu");
   }
   providers.push("wasm");
 
-  const session = await ort.InferenceSession.create(buf.buffer, {
-    executionProviders: providers,
-  });
-  log(`  ${name} loaded (${(loaded / 1024 / 1024).toFixed(1)} MB) [${providers[0]}]`);
+  const sessionOptions = { executionProviders: providers };
+  if (externalData) {
+    sessionOptions.externalData = [
+      { path: name + ".onnx.data", data: new Uint8Array(externalData) },
+    ];
+  }
+
+  const session = await ort.InferenceSession.create(modelBuffer, sessionOptions);
+  const totalMB = (modelBytes + (externalData ? externalData.byteLength : 0)) / 1024 / 1024;
+  log(`  ${name} loaded (${totalMB.toFixed(1)} MB) [${providers[0]}]`);
   return session;
 }
 
