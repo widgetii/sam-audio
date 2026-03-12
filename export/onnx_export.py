@@ -157,7 +157,7 @@ def export_dit_forward(model: SAMAudio, output_dir: Path, device: str = "cpu"):
     num_samples = (num_samples // hop) * hop
     T = num_samples // hop
 
-    C = model.audio_codec.quantizer.in_proj.out_features // 2
+    C = model.audio_codec.quantizer.in_proj.out_channels // 2
     B, S = 1, 16
 
     noisy_audio = torch.randn(B, T, 2 * C, device=device)
@@ -252,7 +252,7 @@ def export_dacvae(model: SAMAudio, output_dir: Path, device: str = "cpu"):
 
         # --- Decoder ---
         decoder_wrapper = DACVAEDecoderWrapper(model.audio_codec).to(device).eval()
-        C_latent = model.audio_codec.quantizer.in_proj.out_features // 2
+        C_latent = model.audio_codec.quantizer.in_proj.out_channels // 2
         T = samples // hop
         features = torch.randn(B, C_latent, T, device=device)
 
