@@ -13,7 +13,7 @@ authors = [
 
 readme = "README.md"
 license = { file="LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "dacvae",
     "audiobox_aesthetics",
@@ -34,6 +34,10 @@ dependencies = [
 
 [dependency-groups]
 dev = ["ruff"]
+export = ["onnx>=1.17", "onnxruntime", "onnxscript"]
+
+[tool.uv]
+override-dependencies = ["protobuf>=4.25", "ml-dtypes>=0.5"]
 
 [tool.uv.sources]
 dacvae = { git = "https://github.com/facebookresearch/dacvae.git" }
