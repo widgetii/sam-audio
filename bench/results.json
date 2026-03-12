@@ -1,70 +1,158 @@
 [
   {
     "model": "facebook/sam-audio-small",
-    "load_time_s": 71.27,
-    "warmup_time_s": 54.048,
-    "inference_mean_s": 54.726,
-    "inference_std_s": 0.1551,
+    "load_time_s": 71.271,
+    "warmup_time_s": 35.832,
+    "inference_mean_s": 35.405,
+    "inference_std_s": 0.1876,
     "inference_runs_s": [
-      54.508,
-      54.852,
-      54.818
+      35.15,
+      35.469,
+      35.596
     ],
-    "peak_gpu_memory_gb": 76.564,
+    "peak_gpu_memory_gb": 60.754,
     "target_shape": [
       9768960
     ],
     "residual_shape": [
       9768960
     ],
-    "clap_similarity": 0.507,
-    "judge_overall": 2.9633,
-    "judge_precision": 2.682,
-    "judge_recall": 4.6772,
-    "judge_faithfulness": 3.2274,
-    "aesthetic_pq": 5.9253,
-    "aesthetic_ce": 3.6611
+    "clap_similarity": 0.4445,
+    "judge_overall": 2.9682,
+    "judge_precision": 2.7163,
+    "judge_recall": 4.7097,
+    "judge_faithfulness": 3.0736,
+    "aesthetic_pq": 5.9102,
+    "aesthetic_ce": 3.6392
   },
   {
     "model": "facebook/sam-audio-base",
-    "error": "OOM"
-  },
-  {
-    "model": "facebook/sam-audio-large",
-    "error": "OOM"
-  },
-  {
-    "model": "facebook/sam-audio-small-tv",
-    "load_time_s": 120.529,
-    "warmup_time_s": 53.799,
-    "inference_mean_s": 54.936,
-    "inference_std_s": 0.2111,
+    "load_time_s": 87.628,
+    "warmup_time_s": 50.258,
+    "inference_mean_s": 50.786,
+    "inference_std_s": 0.0535,
     "inference_runs_s": [
-      54.638,
-      55.103,
-      55.068
+      50.754,
+      50.862,
+      50.743
     ],
-    "peak_gpu_memory_gb": 76.564,
+    "peak_gpu_memory_gb": 64.42,
     "target_shape": [
       9768960
     ],
     "residual_shape": [
       9768960
     ],
-    "clap_similarity": 0.3191,
-    "judge_overall": 4.0812,
-    "judge_precision": 4.5291,
-    "judge_recall": 4.6006,
-    "judge_faithfulness": 4.276,
-    "aesthetic_pq": 5.6727,
-    "aesthetic_ce": 3.3562
+    "clap_similarity": 0.4004,
+    "judge_overall": 2.0529,
+    "judge_precision": 3.2359,
+    "judge_recall": 3.6819,
+    "judge_faithfulness": 1.6793,
+    "aesthetic_pq": 5.7234,
+    "aesthetic_ce": 3.5011
+  },
+  {
+    "model": "facebook/sam-audio-large",
+    "load_time_s": 140.613,
+    "warmup_time_s": 81.82,
+    "inference_mean_s": 82.899,
+    "inference_std_s": 0.122,
+    "inference_runs_s": [
+      82.738,
+      82.927,
+      83.032
+    ],
+    "peak_gpu_memory_gb": 74.389,
+    "target_shape": [
+      9768960
+    ],
+    "residual_shape": [
+      9768960
+    ],
+    "clap_similarity": 0.4985,
+    "judge_overall": 4.5371,
+    "judge_precision": 4.8394,
+    "judge_recall": 4.8155,
+    "judge_faithfulness": 4.4157,
+    "aesthetic_pq": 6.0829,
+    "aesthetic_ce": 3.551
+  },
+  {
+    "model": "facebook/sam-audio-small-tv",
+    "load_time_s": 189.504,
+    "warmup_time_s": 35.095,
+    "inference_mean_s": 35.552,
+    "inference_std_s": 0.1504,
+    "inference_runs_s": [
+      35.348,
+      35.603,
+      35.706
+    ],
+    "peak_gpu_memory_gb": 60.754,
+    "target_shape": [
+      9768960
+    ],
+    "residual_shape": [
+      9768960
+    ],
+    "clap_similarity": 0.3509,
+    "judge_overall": 3.7922,
+    "judge_precision": 4.5679,
+    "judge_recall": 4.2666,
+    "judge_faithfulness": 3.9623,
+    "aesthetic_pq": 5.3899,
+    "aesthetic_ce": 3.2669
   },
   {
     "model": "facebook/sam-audio-base-tv",
-    "error": "OOM"
+    "load_time_s": 79.76,
+    "warmup_time_s": 50.012,
+    "inference_mean_s": 50.84,
+    "inference_std_s": 0.1261,
+    "inference_runs_s": [
+      50.667,
+      50.891,
+      50.963
+    ],
+    "peak_gpu_memory_gb": 64.42,
+    "target_shape": [
+      9768960
+    ],
+    "residual_shape": [
+      9768960
+    ],
+    "clap_similarity": 0.4959,
+    "judge_overall": 2.6869,
+    "judge_precision": 4.1086,
+    "judge_recall": 4.7143,
+    "judge_faithfulness": 2.2966,
+    "aesthetic_pq": 5.1526,
+    "aesthetic_ce": 3.2351
   },
   {
     "model": "facebook/sam-audio-large-tv",
-    "error": "OOM"
+    "load_time_s": 136.614,
+    "warmup_time_s": 81.668,
+    "inference_mean_s": 82.898,
+    "inference_std_s": 0.1647,
+    "inference_runs_s": [
+      82.668,
+      82.984,
+      83.043
+    ],
+    "peak_gpu_memory_gb": 74.389,
+    "target_shape": [
+      9768960
+    ],
+    "residual_shape": [
+      9768960
+    ],
+    "clap_similarity": 0.2716,
+    "judge_overall": 3.9998,
+    "judge_precision": 4.2894,
+    "judge_recall": 4.7449,
+    "judge_faithfulness": 3.9942,
+    "aesthetic_pq": 5.9535,
+    "aesthetic_ce": 3.5687
   }
 ]

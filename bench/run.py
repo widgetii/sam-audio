@@ -56,9 +56,10 @@ def timed_separate(model, batch, candidates, max_chunk_tokens=None):
     """Run model.separate() with accurate GPU timing. Returns elapsed seconds."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    result = model.separate(
-        batch, reranking_candidates=candidates, max_chunk_tokens=max_chunk_tokens
-    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        result = model.separate(
+            batch, reranking_candidates=candidates, max_chunk_tokens=max_chunk_tokens
+        )
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     return result, t1 - t0
@@ -125,7 +126,7 @@ def benchmark_model(model_name: str, audio: torch.Tensor):
     }
 
     # Keep result and input audio on CPU for metrics
-    target_wav = result.target[0].cpu()
+    target_wav = result.target[0].cpu().float()  # ensure FP32 for quality metrics
     input_wav = audio.mean(0) if audio.ndim > 1 else audio
 
     # Free GPU memory before metrics
