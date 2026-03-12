@@ -10,28 +10,28 @@ SAM-Audio (Segment Anything Audio) is a Meta Research model for isolating and se
 
 ```bash
 # Install
-pip install .
+uv sync
 
 # Lint
-ruff check .
+uv run ruff check .
 
 # Format check
-ruff format --check .
+uv run ruff format --check .
 
 # Auto-fix lint issues
-ruff check --fix .
+uv run ruff check --fix .
 
 # Auto-format
-ruff format .
+uv run ruff format .
 
 # Run evaluation
-python eval/main.py --setting sfx speech music --batch-size 1 --candidates 8
+uv run python eval/main.py --setting sfx speech music --batch-size 1 --candidates 8
 
 # Multi-GPU evaluation
-torchrun --nproc_per_node=8 eval/main.py
+uv run torchrun --nproc_per_node=8 eval/main.py
 ```
 
-There are no unit tests in this repo. CI runs `ruff format --check` and `ruff check` only.
+There are no unit tests in this repo. CI runs `uv run ruff format --check` and `uv run ruff check` only.
 
 ## Architecture
 

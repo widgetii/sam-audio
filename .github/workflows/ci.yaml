@@ -3,42 +3,21 @@ on:
   push:
   pull_request:
 
-env:
-  CACHE_NUMBER: 0
-
 jobs:
   build:
     runs-on: 32-core-ubuntu
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mamba-org/setup-micromamba@v1.8.1
+      - uses: astral-sh/setup-uv@v5
         with:
-          environment-name: sam-audio
-          init-shell: bash
-          create-args: >-
-            python=3.11
-            pip=24.2
-            ruff==
+          python-version: "3.11"
 
-      - uses: actions/cache@v4
-        with:
-          path: /home/runner/micromamba/envs/sam-audio
-          key: ${{ hashFiles('pyproject.toml') }}-${{ env.CACHE_NUMBER }}
-        id: cache
-
-      - name: Update environment
-        shell: bash -l {0}
-        run: |
-          pip install .
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Install dependencies
+        run: uv sync
 
       - name: Check formatting
-        shell: bash -l {0}
-        run: |
-          ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Lint
-        shell: bash -l {0}
-        run: |
-          ruff check .
+        run: uv run ruff check .
