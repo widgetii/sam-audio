@@ -19,6 +19,7 @@ dependencies = [
     "audiobox_aesthetics",
     "einops",
     "imagebind",
+    "setuptools<81",
     "laion-clap",
     "numpy",
     "perception-models",
