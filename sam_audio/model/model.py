@@ -252,6 +252,7 @@ class SAMAudio(BaseModel):
         ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
         reranking_candidates: int = 1,
         predict_spans: bool = False,
+        max_chunk_tokens: Optional[int] = None,
     ) -> SeparationResult:
         # Encode audio
         forward_args = self._get_forward_args(batch, candidates=reranking_candidates)
@@ -282,17 +283,20 @@ class SAMAudio(BaseModel):
             )
             return res
 
-        states = odeint(
+        generated_features = odeint(
             vector_field,
             noise,
             torch.tensor([0.0, 1.0], device=noise.device),
             **ode_opt,
-        )
-        generated_features = states[-1].transpose(1, 2)
+        )[-1].transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
-        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
-            B, 2, -1
-        )
+        reshaped = generated_features.reshape(2 * B, C, T)
+        if max_chunk_tokens is not None:
+            wavs = self.audio_codec.decode_chunked(
+                reshaped, chunk_tokens=max_chunk_tokens
+            ).view(B, 2, -1)
+        else:
+            wavs = self.audio_codec.decode(reshaped).view(B, 2, -1)
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)

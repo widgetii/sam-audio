@@ -88,6 +88,40 @@ class DACVAE(DACVAEEncoder, Codec):
             emb = self.quantizer.out_proj(encoded_frames)
             return self.decoder(emb)
 
+    def decode_chunked(
+        self,
+        encoded_frames: torch.Tensor,
+        chunk_tokens: int = 500,
+        overlap_tokens: int = 16,
+    ) -> torch.Tensor:
+        T = encoded_frames.shape[-1]
+        if T <= chunk_tokens:
+            return self.decode(encoded_frames)
+
+        overlap_samples = overlap_tokens * self.hop_length
+        output_chunks = []
+        start = 0
+
+        while start < T:
+            end = min(start + chunk_tokens, T)
+            chunk_feat = encoded_frames[..., start:end]
+            chunk_wav = self.decode(chunk_feat)
+
+            if start == 0:
+                # First chunk: keep everything (right overlap will be skipped by next chunk)
+                output_chunks.append(chunk_wav)
+            else:
+                # Subsequent chunks: discard left overlap (already covered by previous chunk)
+                output_chunks.append(chunk_wav[..., overlap_samples:])
+
+            del chunk_wav
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            start += chunk_tokens - overlap_tokens
+
+        return torch.cat(output_chunks, dim=-1)
+
     def feature_idx_to_wav_idx(self, feature_idx, sample_rate=None):
         if sample_rate is None:
             sample_rate = self.sample_rate

@@ -31,7 +31,8 @@ AUDIO_PATH = Path.home() / "chapter_2.mkv"
 PROMPT = "speech"
 RERANKING_CANDIDATES = 2
 NUM_TIMED_RUNS = 3
-MAX_DURATION_S = 30  # Trim audio to avoid OOM on large models
+MAX_DURATION_S = 0  # 0 = no trim (chunked decode handles long audio)
+MAX_CHUNK_TOKENS = 500  # Chunked codec encode/decode to avoid OOM (~20.8s per chunk)
 DEVICE = torch.device("cuda")
 RESULTS_PATH = Path(__file__).resolve().parent / "results.json"
 
@@ -51,20 +52,22 @@ def load_audio(path: str, sr: int = 48_000, max_seconds: float = 0) -> torch.Ten
     return wav
 
 
-def timed_separate(model, batch, candidates):
+def timed_separate(model, batch, candidates, max_chunk_tokens=None):
     """Run model.separate() with accurate GPU timing. Returns elapsed seconds."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    result = model.separate(batch, reranking_candidates=candidates)
+    result = model.separate(
+        batch, reranking_candidates=candidates, max_chunk_tokens=max_chunk_tokens
+    )
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     return result, t1 - t0
 
 
 def benchmark_model(model_name: str, audio: torch.Tensor):
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Model: {model_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
@@ -84,15 +87,19 @@ def benchmark_model(model_name: str, audio: torch.Tensor):
     # Warm-up run (discarded)
     print("  Warm-up run...")
     torch.cuda.reset_peak_memory_stats()
-    result, warmup_time = timed_separate(model, batch, RERANKING_CANDIDATES)
+    result, warmup_time = timed_separate(
+        model, batch, RERANKING_CANDIDATES, MAX_CHUNK_TOKENS
+    )
     print(f"  Warm-up time: {warmup_time:.2f}s")
 
     # Timed runs
     times = []
     for i in range(NUM_TIMED_RUNS):
-        _, elapsed = timed_separate(model, batch, RERANKING_CANDIDATES)
+        _, elapsed = timed_separate(
+            model, batch, RERANKING_CANDIDATES, MAX_CHUNK_TOKENS
+        )
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s")
+        print(f"  Run {i + 1}: {elapsed:.2f}s")
 
     peak_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     mean_time = sum(times) / len(times)
@@ -136,9 +143,9 @@ def compute_quality_metrics(
     """Compute CLAP, Judge, and Aesthetic metrics for all models."""
     from metrics import Aesthetic, Judge
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Computing quality metrics...")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     device = DEVICE
 
@@ -163,7 +170,9 @@ def compute_quality_metrics(
                 sample_rate=48_000,
             )
             encoder.to_file(fpath)
-            audio_embs = clap_model.get_audio_embedding_from_filelist([fpath], use_tensor=True)
+            audio_embs = clap_model.get_audio_embedding_from_filelist(
+                [fpath], use_tensor=True
+            )
             text_embs = clap_model.get_text_embedding([PROMPT], use_tensor=True)
             sim = (audio_embs @ text_embs.T)[0, 0].item()
         rec["clap_similarity"] = round(sim, 4)
@@ -206,9 +215,9 @@ def compute_quality_metrics(
 
 
 def print_summary_table(records):
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("BENCHMARK SUMMARY")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     # Header
     header = (
@@ -245,7 +254,7 @@ def main():
 
     # Load audio once, trimmed to MAX_DURATION_S
     audio = load_audio(str(AUDIO_PATH), max_seconds=MAX_DURATION_S)
-    print(f"Audio shape: {list(audio.shape)}, duration: {audio.shape[-1]/48000:.1f}s")
+    print(f"Audio shape: {list(audio.shape)}, duration: {audio.shape[-1] / 48000:.1f}s")
 
     records = []
     target_wavs = []

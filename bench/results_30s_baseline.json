@@ -1,0 +1,158 @@
+[
+  {
+    "model": "facebook/sam-audio-small",
+    "load_time_s": 123.941,
+    "warmup_time_s": 7.262,
+    "inference_mean_s": 6.494,
+    "inference_std_s": 0.0108,
+    "inference_runs_s": [
+      6.482,
+      6.491,
+      6.508
+    ],
+    "peak_gpu_memory_gb": 34.141,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.232,
+    "judge_overall": 3.9445,
+    "judge_precision": 3.9107,
+    "judge_recall": 4.9218,
+    "judge_faithfulness": 4.9365,
+    "aesthetic_pq": 6.8694,
+    "aesthetic_ce": 3.4905
+  },
+  {
+    "model": "facebook/sam-audio-base",
+    "load_time_s": 88.567,
+    "warmup_time_s": 10.055,
+    "inference_mean_s": 10.139,
+    "inference_std_s": 0.0431,
+    "inference_runs_s": [
+      10.091,
+      10.131,
+      10.196
+    ],
+    "peak_gpu_memory_gb": 36.628,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.2654,
+    "judge_overall": 4.8487,
+    "judge_precision": 4.8796,
+    "judge_recall": 4.9934,
+    "judge_faithfulness": 4.988,
+    "aesthetic_pq": 6.8334,
+    "aesthetic_ce": 3.4572
+  },
+  {
+    "model": "facebook/sam-audio-large",
+    "load_time_s": 150.356,
+    "warmup_time_s": 19.401,
+    "inference_mean_s": 19.757,
+    "inference_std_s": 0.1361,
+    "inference_runs_s": [
+      19.593,
+      19.751,
+      19.926
+    ],
+    "peak_gpu_memory_gb": 43.276,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.2844,
+    "judge_overall": 4.7242,
+    "judge_precision": 4.7707,
+    "judge_recall": 4.9872,
+    "judge_faithfulness": 4.9485,
+    "aesthetic_pq": 6.6201,
+    "aesthetic_ce": 3.4027
+  },
+  {
+    "model": "facebook/sam-audio-small-tv",
+    "load_time_s": 111.263,
+    "warmup_time_s": 6.508,
+    "inference_mean_s": 6.525,
+    "inference_std_s": 0.0135,
+    "inference_runs_s": [
+      6.514,
+      6.517,
+      6.544
+    ],
+    "peak_gpu_memory_gb": 34.135,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.2394,
+    "judge_overall": 4.5534,
+    "judge_precision": 4.612,
+    "judge_recall": 4.9706,
+    "judge_faithfulness": 4.906,
+    "aesthetic_pq": 6.4595,
+    "aesthetic_ce": 3.495
+  },
+  {
+    "model": "facebook/sam-audio-base-tv",
+    "load_time_s": 80.3,
+    "warmup_time_s": 10.1,
+    "inference_mean_s": 10.189,
+    "inference_std_s": 0.0362,
+    "inference_runs_s": [
+      10.144,
+      10.19,
+      10.233
+    ],
+    "peak_gpu_memory_gb": 36.628,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.347,
+    "judge_overall": 4.8937,
+    "judge_precision": 4.9134,
+    "judge_recall": 5.0011,
+    "judge_faithfulness": 4.9804,
+    "aesthetic_pq": 7.0621,
+    "aesthetic_ce": 3.4803
+  },
+  {
+    "model": "facebook/sam-audio-large-tv",
+    "load_time_s": 115.733,
+    "warmup_time_s": 19.442,
+    "inference_mean_s": 19.837,
+    "inference_std_s": 0.1481,
+    "inference_runs_s": [
+      19.646,
+      19.859,
+      20.007
+    ],
+    "peak_gpu_memory_gb": 43.276,
+    "target_shape": [
+      1440000
+    ],
+    "residual_shape": [
+      1440000
+    ],
+    "clap_similarity": 0.3779,
+    "judge_overall": 4.2968,
+    "judge_precision": 4.3142,
+    "judge_recall": 4.8729,
+    "judge_faithfulness": 4.9936,
+    "aesthetic_pq": 6.7955,
+    "aesthetic_ce": 3.5855
+  }
+]
