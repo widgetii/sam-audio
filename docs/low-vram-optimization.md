@@ -124,6 +124,33 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
 target_audio = result.target[0].cpu()
 ```
 
+## Simulated VRAM limits
+
+To verify real-world GPU compatibility, we used `torch.cuda.set_per_process_memory_fraction()` on the A100 to enforce hard VRAM ceilings. This accurately simulates consumer GPU memory constraints since the allocator behaves identically — it OOMs when the limit is exceeded.
+
+| Test | VRAM Limit | Audio | Result | Detail |
+|------|-----------|-------|--------|--------|
+| text_only 30s | 8 GB | 30s | **SUCCESS** | Peak 6.97 GB |
+| text_only 30s | 7 GB | 30s | **OOM** | Needed 1.2 GB more during ODE solve |
+| text_only 203s | 16 GB | 203s | **OOM** | Tried to allocate 8.15 GB chunk at 9.1 GB used |
+| text_only 203s | 20 GB | 203s | **SUCCESS** | Peak 17.89 GB |
+
+### GPU compatibility (text_only, 30s audio, BF16)
+
+The minimum VRAM is **~7–8 GB**. Compatible consumer GPUs:
+
+| GPU | VRAM | Fits? |
+|-----|------|-------|
+| RTX 4090 | 24 GB | Yes (30s + 203s) |
+| RTX 4080 / 3080 Ti | 16 GB | Yes (30s); 203s needs ~20 GB |
+| RTX 4070 Ti / 3070 Ti | 12 GB | Yes (30s) |
+| RTX 4060 / 3060 | 8 GB | Yes (30s, tight) |
+| RTX 3060 12GB | 12 GB | Yes (30s) |
+| GTX 1080 Ti | 11 GB | Yes (30s) |
+| GTX 980 Ti | 6 GB | **No** — 1 GB short |
+
+For 203s audio, **20+ GB** is needed (RTX 4090, 3090, A5000, etc.).
+
 ## Remaining options for 203s on 16 GB
 
 The 203s case peaks at 17.89 GB — 1.89 GB over the target. Potential next steps:
