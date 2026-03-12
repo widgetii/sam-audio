@@ -146,10 +146,19 @@ def export_dit_forward(model: SAMAudio, output_dir: Path, device: str = "cpu"):
     print("Exporting DiT forward...")
     wrapper = DitForwardWrapper(model).to(device).eval()
 
-    # Example shapes for tracing — small model uses dim=128 latent per codec channel
-    # audio_codec latent_dim=128, so C=128 and audio_features is [B,T,2C]=256
-    C = 128  # typical latent dim for small model
-    B, T, S = 1, 64, 16
+    # Compute realistic trace shapes from the model config.
+    # The TorchScript tracer bakes shape-dependent padding as constants,
+    # so we must trace with the same T that will be used at inference.
+    # Default validation uses 5s audio at 48kHz with hop_length=1920 → T=125.
+    hop = model.audio_codec.hop_length
+    sample_rate = model.audio_codec.sample_rate
+    trace_duration_sec = 5.0
+    num_samples = int(trace_duration_sec * sample_rate)
+    num_samples = (num_samples // hop) * hop
+    T = num_samples // hop
+
+    C = model.audio_codec.quantizer.in_proj.out_features // 2
+    B, S = 1, 16
 
     noisy_audio = torch.randn(B, T, 2 * C, device=device)
     audio_features = torch.randn(B, T, 2 * C, device=device)
@@ -217,9 +226,11 @@ def export_dacvae(model: SAMAudio, output_dir: Path, device: str = "cpu"):
         # --- Encoder ---
         encoder_wrapper = DACVAEEncoderWrapper(model.audio_codec).to(device).eval()
         hop = model.audio_codec.hop_length
+        sample_rate = model.audio_codec.sample_rate
         B = 1
-        # Use a waveform length that's a multiple of hop_length
-        samples = hop * 64  # 64 tokens worth
+        # Trace with 5s audio (matching default validation duration)
+        samples = int(5.0 * sample_rate)
+        samples = (samples // hop) * hop
         waveform = torch.randn(B, 1, samples, device=device)
 
         encoder_path = output_dir / "dacvae_encoder.onnx"
@@ -241,8 +252,8 @@ def export_dacvae(model: SAMAudio, output_dir: Path, device: str = "cpu"):
 
         # --- Decoder ---
         decoder_wrapper = DACVAEDecoderWrapper(model.audio_codec).to(device).eval()
-        C_latent = 128
-        T = 64
+        C_latent = model.audio_codec.quantizer.in_proj.out_features // 2
+        T = samples // hop
         features = torch.randn(B, C_latent, T, device=device)
 
         decoder_path = output_dir / "dacvae_decoder.onnx"
