@@ -98,8 +98,17 @@ def main():
         out_path = output_dir / f"{name}.onnx"
 
         # Check for external data (T5 dynamo exporter creates .onnx.data files)
-        has_external = (path.parent / f"{path.name}.data").exists()
+        external_data_path = path.parent / f"{path.name}.data"
+        has_external = external_data_path.exists()
         convert_to_fp16(path, out_path, load_external=has_external)
+
+        # Delete FP32 source to free disk space for next model
+        if input_dir != output_dir:
+            path.unlink()
+            print(f"  Deleted {path} to free disk space")
+            if has_external:
+                external_data_path.unlink()
+                print(f"  Deleted {external_data_path}")
 
     # Copy tokenizer
     tokenizer_src = input_dir / "t5_tokenizer"

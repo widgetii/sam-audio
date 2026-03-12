@@ -19,13 +19,13 @@ WebGPU provides compute shader access with performance roughly 60-80% of native 
 
 SAM-Audio small (text_only) — measured ONNX model sizes (FP32):
 
-| Component | ONNX Size (FP32) | FP16 (est.) |
+| Component | ONNX Size (FP32) | FP16 (actual) |
 |-----------|-----------------|-------------|
-| T5-base encoder | 0.9 MB | 0.5 MB |
-| DiT (transformer + proj + align) | 1903.0 MB | 951.5 MB |
-| DACVAE encoder | 105.1 MB | 52.6 MB |
-| DACVAE decoder | 305.8 MB | 152.9 MB |
-| **Total weights** | **2314.8 MB** | **~1157 MB** |
+| T5-base encoder | 420 MB (0.9 MB + 419 MB data) | 211 MB |
+| DiT (transformer + proj + align) | 1903 MB | 957 MB |
+| DACVAE encoder | 106 MB | 53 MB |
+| DACVAE decoder | 306 MB | 153 MB |
+| **Total weights** | **2735 MB** | **1374 MB** |
 | Peak activations (30s audio) | ~2 GB | ~1 GB |
 | **Peak total (est.)** | **~4.3 GB** | **~2.2 GB** |
 
@@ -178,11 +178,14 @@ INT8 is the sweet spot — halves model size with minimal quality loss. INT4 wou
 - Legacy TorchScript exporter required (dynamo fails on dynamic padding)
 - Sequence length baked at trace time (T=125 for 5s audio)
 
-### Phase 2: Browser Runtime
-- Load ONNX models in browser with ONNX Runtime Web (WebGPU backend)
-- Implement JavaScript ODE solver (midpoint method)
-- INT8 quantization of DiT and T5
-- Basic web UI for file upload + text prompt
+### Phase 2: Browser Runtime (Complete)
+- FP16 quantized all 4 ONNX models: 2.3 GB FP32 → 1.37 GB FP16
+  - T5 encoder: 211 MB, DiT forward: 957 MB, DACVAE encoder: 53 MB, DACVAE decoder: 153 MB
+- Built web UI (`web/index.html` + `web/app.js`) with ONNX Runtime Web 1.21.0
+- JavaScript ODE solver (midpoint method, 16 steps / 32 DiT evaluations)
+- T5 tokenization via Transformers.js (`@huggingface/transformers@3.4.2`)
+- WebGPU backend with WASM fallback
+- Dev server (`web/serve.py`) with COOP/COEP headers for SharedArrayBuffer
 
 ### Phase 3: Optimization
 - INT4 quantization evaluation
@@ -193,4 +196,4 @@ INT8 is the sweet spot — halves model size with minimal quality loss. INT4 wou
 
 ## Conclusion
 
-Browser deployment of SAM-Audio small is technically feasible with today's WebGPU. Phase 1 validated that all model components export to ONNX with near-perfect numerical equivalence (max error 4.1e-5, cosine similarity 1.0). The main remaining challenge is inference latency (32 DiT evaluations at ~0.5-1s each in WebGPU). The resulting 15-45 second processing time is acceptable for an offline tool. Memory requirements (~2.2 GB FP16) fit within browser limits with room to spare.
+Browser deployment of SAM-Audio small is technically feasible with today's WebGPU. Phase 1 validated that all model components export to ONNX with near-perfect numerical equivalence (max error 4.1e-5, cosine similarity 1.0). Phase 2 delivered a complete browser runtime: FP16 quantized models (1.37 GB total), web UI with ONNX Runtime Web (WebGPU + WASM backends), JavaScript ODE solver, and T5 tokenization via Transformers.js. The main remaining challenge is inference latency (32 DiT evaluations at ~0.5-1s each in WebGPU). The resulting 15-45 second processing time is acceptable for an offline tool. Memory requirements (~2.2 GB peak with FP16 weights) fit within browser limits with room to spare.
