@@ -35,6 +35,12 @@ dependencies = [
 [dependency-groups]
 dev = ["ruff"]
 export = ["onnx>=1.17", "onnxruntime", "onnxscript"]
+dialogue = [
+    "insightface",
+    "onnxruntime",
+    "scikit-learn",
+    "sam3 @ git+https://github.com/facebookresearch/sam3.git",
+]
 
 [tool.uv]
 override-dependencies = ["protobuf>=4.25", "ml-dtypes>=0.5"]
