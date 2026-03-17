@@ -194,6 +194,87 @@ INT8 is the sweet spot — halves model size with minimal quality loss. INT4 wou
 - Service Worker for background processing
 - IndexedDB caching for model weights
 
+## Implementation Details
+
+### File Structure
+
+```
+export/
+  onnx_export.py          # PyTorch → ONNX export (4 models)
+  onnx_validate.py        # Numerical equivalence validation
+  quantize.py             # FP32 → FP16 quantization
+  onnx_models/            # FP32 ONNX output (not committed, ~2.7 GB)
+  onnx_models_web/        # FP16 ONNX output (not committed, ~1.4 GB)
+    t5_encoder.onnx
+    dit_forward.onnx
+    dacvae_encoder.onnx
+    dacvae_decoder.onnx
+    t5_tokenizer/         # HuggingFace tokenizer files
+web/
+  index.html              # Single-page UI
+  app.js                  # Browser inference pipeline
+  serve.py                # Dev server with COOP/COEP headers
+```
+
+### ONNX Export Architecture
+
+The PyTorch `SAMAudio` model is split into 4 ONNX graphs because the ODE solver uses a Python closure that can't be traced:
+
+1. **T5 encoder** — Exported via PyTorch dynamo exporter. Standard HuggingFace `T5EncoderModel`. Creates external data file (`.onnx.data`) for weights.
+2. **DiT forward** — Exported via legacy TorchScript exporter (dynamo fails on dynamic padding in `Patcher`'s Conv1d). Wraps `SAMAudio.forward()` logic: `proj → align_masked_video → memory_proj + timestep_emb → transformer`. Skips `embed_anchors` (identity in text_only mode).
+3. **DACVAE encoder** — Legacy exporter. Wraps `encoder → quantizer.in_proj → chunk → mean`. Requires `remove_weight_norm` on all submodules before tracing. Input must be pre-padded to `hop_length` multiple (padding logic is data-dependent).
+4. **DACVAE decoder** — Legacy exporter. Wraps `quantizer.out_proj → decoder`.
+
+Key constraint: TorchScript tracer bakes shape-dependent constants (padding, sequence length). Models are traced with T=125 (5s audio at 48kHz, hop_length=1920). Different audio durations work via dynamic axes, but the baked padding constants match this trace shape.
+
+### FP16 Quantization
+
+`export/quantize.py` converts FP32 ONNX initializers to float16 in-place. Deletes each FP32 source file after conversion to manage disk space on constrained machines. Models under 1800 MB are saved as single files; larger models use ONNX external data format.
+
+### Browser Runtime (`web/app.js`)
+
+**Dependencies** (loaded from CDN):
+- `onnxruntime-web@1.21.0` — ONNX inference with WebGPU/WASM backends
+- `@huggingface/transformers@3.4.2` — T5 tokenizer (via `AutoTokenizer`)
+
+**Session creation**: Each ONNX model is fetched with progress tracking. A HEAD request checks for `.onnx.data` external data files. Sessions prefer `webgpu` execution provider, falling back to `wasm`.
+
+**Pipeline** (in `separate()`):
+
+```
+1. Load audio → Web Audio API decodeAudioData → resample to 48kHz mono → pad to hop_length
+2. DACVAE encode: waveform [1,1,samples] → features [1,C,T]  (C=128)
+3. Prepare DiT input: transpose [1,C,T] → [1,T,C], duplicate → [1,T,2C]  (2C=256)
+4. T5 encode: tokenize text → input_ids + attention_mask (int64) → last_hidden_state [1,S,768]
+5. ODE solve: 16 midpoint steps (32 DiT evaluations)
+   - k1 = DiT(y, t), y_mid = y + k1*(dt/2)
+   - k2 = DiT(y_mid, t+dt/2), y = y + k2*dt
+   - dt = 2/32, t ∈ [0, 1)
+6. Split output [1,T,2C] → target [1,C,T] + residual [1,C,T]  (transpose back)
+7. DACVAE decode each → waveform [1,1,samples]
+8. Convert to 16-bit PCM WAV blobs → <audio> elements
+```
+
+**Tensor layout conventions**: The DiT operates in `[batch, time, channels]` format while DACVAE uses `[batch, channels, time]`. The app transposes between these at steps 3 and 6. The `audio_features` input to DiT is the DACVAE features duplicated along the channel axis (`[1,T,2C]`) — this matches `SAMAudio.forward()` which concatenates `[noisy_audio, zeros, audio_features]` along dim=2.
+
+**Unused inputs**: `masked_video_features` is zeros (text_only mode, no video). `audio_pad_mask` is all-true (no padding within the sequence).
+
+### Dev Server (`web/serve.py`)
+
+Python `http.server` with:
+- **COOP/COEP headers** (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`) — required for `SharedArrayBuffer`, which ONNX Runtime WASM threads need
+- **CORS header** (`Access-Control-Allow-Origin: *`)
+- **Route mapping**: `/models/*` → configurable models directory, everything else → `web/` directory
+- Binds to `0.0.0.0` for network access
+
+### Known Limitations
+
+1. **Fixed trace shape**: DiT was traced with T=125 (5s audio). Other durations work via ONNX dynamic axes but may have suboptimal padding behavior baked from the trace.
+2. **Text-only mode**: Visual prompts (video frames + masks) are not supported in the browser pipeline. The `masked_video_features` input is always zeros.
+3. **Single candidate**: The PyTorch model generates multiple candidates and re-ranks them. The browser pipeline generates one candidate (no CLAP/Judge ranker).
+4. **No chunked decode**: Long audio is decoded in one pass. The PyTorch model supports `decode_chunked()` for memory efficiency.
+5. **FP16 overflow**: Quantization produces numpy overflow warnings for outlier FP32 values that exceed FP16 range. These are clamped to ±65504.
+
 ## Conclusion
 
 Browser deployment of SAM-Audio small is technically feasible with today's WebGPU. Phase 1 validated that all model components export to ONNX with near-perfect numerical equivalence (max error 4.1e-5, cosine similarity 1.0). Phase 2 delivered a complete browser runtime: FP16 quantized models (1.37 GB total), web UI with ONNX Runtime Web (WebGPU + WASM backends), JavaScript ODE solver, and T5 tokenization via Transformers.js. The main remaining challenge is inference latency (32 DiT evaluations at ~0.5-1s each in WebGPU). The resulting 15-45 second processing time is acceptable for an offline tool. Memory requirements (~2.2 GB peak with FP16 weights) fit within browser limits with room to spare.
