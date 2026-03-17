@@ -186,13 +186,18 @@ def extract_chunk_frames(
     start_sec: float,
     end_sec: float,
     fps: float,
+    max_frames: int = 500,
 ) -> torch.Tensor:
-    """Extract video frames for a time range."""
-    start_frame = max(0, int(start_sec * fps))
-    end_frame = min(len(video_decoder), int(end_sec * fps))
-    if start_frame >= end_frame:
-        end_frame = start_frame + 1
-    return video_decoder.get_frames_in_range(start_frame, end_frame - start_frame).data
+    """Extract video frames for a time range using timestamp-based access."""
+    # Sample at ~fps rate, capped to avoid excessive memory
+    num_frames = min(int((end_sec - start_sec) * fps), max_frames)
+    if num_frames <= 0:
+        num_frames = 1
+    timestamps = [
+        start_sec + i * (end_sec - start_sec) / num_frames for i in range(num_frames)
+    ]
+    frames = [video_decoder.get_frame_played_at(t).data for t in timestamps]
+    return torch.stack(frames)
 
 
 # --- Resume support ---
@@ -379,27 +384,33 @@ def process_movie(args):
     # Open video decoder
     video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
     fps = video_decoder.metadata.average_fps_from_header
-    total_video_frames = len(video_decoder)
-
     # Face detection on sampled frames
     # Use 2s interval — CPU-based InsightFace is slow; 0.5s is better with GPU onnxruntime
     sample_interval = 2.0
-    frame_step = max(1, int(fps * sample_interval))
-    sample_frame_indices = list(range(0, total_video_frames, frame_step))
-    logger.info(f"Detecting faces on {len(sample_frame_indices)} sampled frames")
+    sample_timestamps = [
+        t
+        for t in (
+            i * sample_interval
+            for i in range(int(total_duration / sample_interval) + 1)
+        )
+        if t < total_duration
+    ]
+    logger.info(f"Detecting faces on {len(sample_timestamps)} sampled frames")
 
     all_detections = []
     batch_size = 32
     for batch_start in tqdm(
-        range(0, len(sample_frame_indices), batch_size), desc="Pass 0: face detection"
+        range(0, len(sample_timestamps), batch_size), desc="Pass 0: face detection"
     ):
-        batch_indices = sample_frame_indices[batch_start : batch_start + batch_size]
-        # Fetch sampled frames individually since they're non-consecutive
+        batch_ts = sample_timestamps[batch_start : batch_start + batch_size]
         frame_tensors = []
-        for fi in batch_indices:
-            frame_tensors.append(video_decoder.get_frames_in_range(fi, 1).data[0])
+        for ts in batch_ts:
+            frame_tensors.append(video_decoder.get_frame_played_at(ts).data)
         frames_batch = torch.stack(frame_tensors)
-        dets = face_tracker.detect_faces(frames_batch, frame_indices=batch_indices)
+        dets = face_tracker.detect_faces(
+            frames_batch,
+            frame_indices=list(range(batch_start, batch_start + len(batch_ts))),
+        )
         all_detections.extend(dets)
         del frames_batch, frame_tensors
 
