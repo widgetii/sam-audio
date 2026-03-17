@@ -188,16 +188,17 @@ def extract_chunk_frames(
     fps: float,
     max_frames: int = 500,
 ) -> torch.Tensor:
-    """Extract video frames for a time range using timestamp-based access."""
-    # Sample at ~fps rate, capped to avoid excessive memory
-    num_frames = min(int((end_sec - start_sec) * fps), max_frames)
-    if num_frames <= 0:
-        num_frames = 1
-    timestamps = [
-        start_sec + i * (end_sec - start_sec) / num_frames for i in range(num_frames)
-    ]
-    frames = [video_decoder.get_frame_played_at(t).data for t in timestamps]
-    return torch.stack(frames)
+    """Extract video frames for a time range using batch range access.
+
+    Uses get_frames_played_in_range() for efficient sequential decoding,
+    then subsamples to max_frames if needed.
+    """
+    batch = video_decoder.get_frames_played_in_range(start_sec, end_sec)
+    frames = batch.data
+    if frames.shape[0] > max_frames:
+        indices = torch.linspace(0, frames.shape[0] - 1, max_frames).round().long()
+        frames = frames[indices]
+    return frames
 
 
 # --- Resume support ---
@@ -399,20 +400,31 @@ def process_movie(args):
 
     all_detections = []
     batch_size = 32
-    for batch_start in tqdm(
+    for range_start_idx in tqdm(
         range(0, len(sample_timestamps), batch_size), desc="Pass 0: face detection"
     ):
-        batch_ts = sample_timestamps[batch_start : batch_start + batch_size]
+        batch_ts = sample_timestamps[range_start_idx : range_start_idx + batch_size]
+        # Use range-based access: fetch all frames in [first_ts, last_ts + epsilon]
+        range_batch = video_decoder.get_frames_played_in_range(
+            batch_ts[0], batch_ts[-1] + 0.01
+        )
+        range_frames = range_batch.data
+        range_pts = range_batch.pts_seconds
+
+        # Pick the frame closest to each desired timestamp
         frame_tensors = []
         for ts in batch_ts:
-            frame_tensors.append(video_decoder.get_frame_played_at(ts).data)
+            diffs = (range_pts - ts).abs()
+            best_idx = diffs.argmin().item()
+            frame_tensors.append(range_frames[best_idx])
+
         frames_batch = torch.stack(frame_tensors)
         dets = face_tracker.detect_faces(
             frames_batch,
-            frame_indices=list(range(batch_start, batch_start + len(batch_ts))),
+            frame_indices=list(range(range_start_idx, range_start_idx + len(batch_ts))),
         )
         all_detections.extend(dets)
-        del frames_batch, frame_tensors
+        del frames_batch, frame_tensors, range_frames, range_batch
 
     # Cluster into characters
     logger.info("Clustering faces into characters")
