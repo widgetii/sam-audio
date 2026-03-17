@@ -76,9 +76,11 @@ Strippable components total ~16+ GB FP32. Core model is only ~3.3 GB FP32 / ~1.6
 
 | Config | Peak VRAM | Inference | Load time | Fits 16 GB? |
 |--------|-----------|-----------|-----------|-------------|
-| Full model, 30s | 29.37 GB | 5.52s | 168s | No |
-| **text_only, 30s** | **6.97 GB** | **2.76s** | **9s** | **Yes** |
-| **text_only, 203s** | **17.89 GB** | **20.92s** | **9s** | No (by 1.89 GB) |
+| Full model, 203s | 60.86 GB | 33.88s | 96s | No |
+| **text_only, 30s** | **6.97 GB** | **3.93s** | **11s** | **Yes** |
+| **text_only, 60s** | **7.15 GB** | **5.08s** | **11s** | **Yes** |
+| **text_only, 120s** | **11.63 GB** | **10.81s** | **11s** | **Yes** |
+| **text_only, 203s** | **17.89 GB** | **21.01s** | **11s** | No (by 1.89 GB) |
 
 ### VRAM breakdown (text_only, 30s, BF16)
 
@@ -123,6 +125,26 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
 
 target_audio = result.target[0].cpu()
 ```
+
+## VRAM scaling with audio duration
+
+VRAM scales roughly linearly with audio length due to ODE activations. Measured on A100 with text_only + BF16 + chunked decode:
+
+| Duration | Tokens | Peak VRAM | Inference |
+|----------|--------|-----------|-----------|
+| 30s | ~750 | 6.97 GB | 3.93s |
+| 60s | ~1500 | 7.15 GB | 5.08s |
+| 120s | ~3000 | 11.63 GB | 10.81s |
+| 203s | ~5075 | 17.89 GB | 21.01s |
+
+The base cost is ~5 GB (model weights + overhead). Each additional minute of audio adds ~1.5–2 GB. Maximum audio durations per GPU tier:
+
+| GPU VRAM | Max duration (approx) |
+|----------|----------------------|
+| 8 GB | ~30–40s |
+| 12 GB | ~90–100s |
+| 16 GB | ~150–160s |
+| 24 GB | 203s+ |
 
 ## Simulated VRAM limits
 
