@@ -218,6 +218,9 @@ class SAMAudio(BaseModel):
 
     def _get_forward_args(self, batch: Batch, candidates: int = 1):
         audio_features = self._get_audio_features(batch.audios)
+        device = audio_features.device
+        if self._text_only:
+            self.text_encoder.to(device)
         text_features, text_mask = self.text_encoder(batch.descriptions)
         if self._text_only:
             self.text_encoder.to("cpu")
