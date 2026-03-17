@@ -381,11 +381,11 @@ def process_movie(args):
     fps = video_decoder.metadata.average_fps_from_header
     total_video_frames = len(video_decoder)
 
-    # Face detection on sampled frames (every 0.5s)
-    sample_interval = 0.5
-    sample_frame_indices = list(
-        range(0, total_video_frames, max(1, int(fps * sample_interval)))
-    )
+    # Face detection on sampled frames
+    # Use 2s interval — CPU-based InsightFace is slow; 0.5s is better with GPU onnxruntime
+    sample_interval = 2.0
+    frame_step = max(1, int(fps * sample_interval))
+    sample_frame_indices = list(range(0, total_video_frames, frame_step))
     logger.info(f"Detecting faces on {len(sample_frame_indices)} sampled frames")
 
     all_detections = []
@@ -394,11 +394,14 @@ def process_movie(args):
         range(0, len(sample_frame_indices), batch_size), desc="Pass 0: face detection"
     ):
         batch_indices = sample_frame_indices[batch_start : batch_start + batch_size]
-        frames_batch = video_decoder.get_frames_in_range(
-            batch_indices[0], len(batch_indices)
-        ).data
+        # Fetch sampled frames individually since they're non-consecutive
+        frame_tensors = []
+        for fi in batch_indices:
+            frame_tensors.append(video_decoder.get_frames_in_range(fi, 1).data[0])
+        frames_batch = torch.stack(frame_tensors)
         dets = face_tracker.detect_faces(frames_batch, frame_indices=batch_indices)
         all_detections.extend(dets)
+        del frames_batch, frame_tensors
 
     # Cluster into characters
     logger.info("Clustering faces into characters")
