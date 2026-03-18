@@ -703,10 +703,10 @@ def main():
     )
     parser.add_argument("--device", default=None, help="Device (default: auto)")
     parser.add_argument(
-        "--window-seconds", type=float, default=180, help="Chunk window size in seconds"
+        "--window-seconds", type=float, default=90, help="Chunk window size in seconds"
     )
     parser.add_argument(
-        "--overlap-seconds", type=float, default=10, help="Chunk overlap in seconds"
+        "--overlap-seconds", type=float, default=5, help="Chunk overlap in seconds"
     )
     parser.add_argument(
         "--rms-threshold-db",
