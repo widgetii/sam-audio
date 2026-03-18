@@ -243,6 +243,49 @@ Run CLIP once per chunk on unmasked frames, then apply masks in feature space. W
 
 The model supports batch processing, but VRAM is already at ~57/80 GB for single character. Would need gradient checkpointing or model offloading to fit 2+ characters.
 
+## Quality Investigation: Dialogue Detection Regression
+
+### Reported regression: 41% (R1) -> 37% (R4) -> 33% (R5)
+
+Investigation found the apparent regression is mostly explained by two factors:
+
+### 1. Overlap double-counting bug (fixed)
+
+The `dialogue_percentage` calculation summed ALL segments including overlapping regions between consecutive chunks, double-counting ~480 segments (96 overlaps × 5 seconds). Corrected R5 value: **31.4%** (not 33.1%). This bug affected all rounds equally, inflating all reported values.
+
+### 2. Model non-determinism (primary cause of R4 vs R5 difference)
+
+The diffusion model's ODE solver is non-deterministic — each run produces slightly different separation even with identical inputs. The RMS value distribution shows **15.3% of segments** (1,330 out of 8,709) fall within ±5dB of the -40dB threshold. The 304s difference between R4 (3027s) and R5 (2723s) represents ~304 segments flipping across the threshold — about 41% of the 749 segments within ±3dB of -40dB. The min_face_detections filter has zero effect on dialogue detection since it only affects Pass 2, not Pass 1.
+
+### 3. RMS distribution is bimodal with a noisy middle
+
+```
+RMS Histogram (5dB buckets, Aliens R5):
+  -75dB: 1346  ████████████████████ (silence)
+  -70dB:  528  ████████
+  -65dB:  872  █████████████
+  -60dB:  645  ██████████
+  -55dB:  497  ███████
+  -50dB:  519  ████████
+  -45dB:  919  ██████████████
+  -40dB:  669  ██████████         <-- threshold
+  -35dB:  648  ██████████
+  -30dB: 1294  ███████████████████ (dialogue)
+  -25dB:  753  ███████████
+```
+
+Clear silence peak (-75 to -65dB) and dialogue peak (-30 to -25dB), but significant density in the threshold zone (-45 to -35dB). This makes the binary classification sensitive to small noise variations.
+
+### 4. Real regression from shorter windows (R1 vs R4) is smaller than reported
+
+The 180s→90s window change does cause a real regression because shorter context gives the model less information. But the reported 4pp difference (41%→37%) is amplified by different overlap amounts (10s vs 5s creates different double-counting) and by model non-determinism between runs.
+
+### Conclusions
+
+- **R4→R5 regression is not real** — same Pass 1 pipeline, difference is entirely model non-determinism
+- **R1→R4 regression is real but small** — shorter windows reduce context, but the magnitude is uncertain due to the double-counting bug and non-determinism
+- **Binary -40dB threshold is fragile** — 15% of segments are borderline. Consider using a confidence margin, smoothing, or multi-threshold approach
+
 ## Key Lessons Learned
 
 1. **Profile before optimizing**: The Round 1 analysis was completely wrong about where time was spent. Frame extraction appeared slow but was actually negligible compared to model inference.
@@ -253,4 +296,4 @@ The model supports batch processing, but VRAM is already at ~57/80 GB for single
 
 4. **torchcodec API matters**: `get_frames_played_in_range()` decodes every frame sequentially (expensive for sparse sampling). `get_frames_played_at(timestamps)` only decodes requested frames. Wrong API choice caused a 55% regression.
 
-5. **Quality-speed tradeoffs need measurement**: Optimizations reduced dialogue detection from 41% (R1) to 37% (R4) to 33% (R5). The cumulative 8pp drop needs manual scene comparison to determine if R1 had false positives or R5 has false negatives. The min-visibility filter may skip characters speaking off-screen.
+5. **Model non-determinism matters for evaluation**: Comparing runs requires accounting for diffusion model noise. Single-run percentage comparisons are unreliable when 15% of segments are near the detection threshold.

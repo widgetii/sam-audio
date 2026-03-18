@@ -673,11 +673,14 @@ def process_movie(args):
 
     timeline = build_timeline(chunk_results, args.min_gap_seconds)
 
-    # Statistics
+    # Statistics — deduplicate overlapping segments (later chunk wins)
+    all_segments = {}
+    for chunk in chunk_results:
+        for seg in chunk["segments"]:
+            all_segments[seg["start_time"]] = seg
     total_dialogue = sum(
         seg["end_time"] - seg["start_time"]
-        for chunk in chunk_results
-        for seg in chunk["segments"]
+        for seg in all_segments.values()
         if seg["has_dialogue"]
     )
     quality_scores = [
