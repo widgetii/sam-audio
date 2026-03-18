@@ -477,11 +477,17 @@ def process_movie(args):
             1.0 / sample_interval,
             sample_interval,
         )
-        # Filter to tracked characters only
+        # Filter to tracked characters only, store detection counts
         visible_char_ids = [
             c.character_id for c in visible_chars if c.character_id in characters
         ]
+        char_detection_counts = {
+            c.character_id: c.total_frames
+            for c in visible_chars
+            if c.character_id in characters
+        }
         chunk_meta["visible_characters"] = visible_char_ids
+        chunk_meta["char_detection_counts"] = char_detection_counts
         chunk_meta["needs_visual_pass"] = (
             len(visible_char_ids) >= 2 and chunk_meta["has_any_dialogue"]
         )
@@ -502,6 +508,24 @@ def process_movie(args):
 
     multi_speaker_chunks = [c for c in chunk_results if c["needs_visual_pass"]]
     logger.info(f"{len(multi_speaker_chunks)} / {len(chunks)} chunks need visual pass")
+
+    # Count char-chunks before and after min_face_detections filtering
+    total_char_chunks = sum(len(c["visible_characters"]) for c in multi_speaker_chunks)
+    eligible_char_chunks = sum(
+        sum(
+            1
+            for cid in c["visible_characters"]
+            if c.get("char_detection_counts", {}).get(
+                cid, c.get("char_detection_counts", {}).get(str(cid), 0)
+            )
+            >= args.min_face_detections
+        )
+        for c in multi_speaker_chunks
+    )
+    logger.info(
+        f"Char-chunks: {eligible_char_chunks} eligible of {total_char_chunks} total "
+        f"(min_face_detections={args.min_face_detections})"
+    )
 
     completed_pass2 = set(progress["pass2_completed"])
 
@@ -543,7 +567,21 @@ def process_movie(args):
             aligned_detections = [[] for _ in range(chunk_frames.shape[0])]
 
         character_segments = []
-        for char_id in chunk_meta["visible_characters"]:
+        det_counts = chunk_meta.get("char_detection_counts", {})
+        eligible_chars = [
+            cid
+            for cid in chunk_meta["visible_characters"]
+            if det_counts.get(cid, det_counts.get(str(cid), 0))
+            >= args.min_face_detections
+        ]
+        if len(eligible_chars) < 2:
+            logger.debug(
+                f"Chunk {idx}: only {len(eligible_chars)} chars above "
+                f"min_face_detections={args.min_face_detections}, skipping visual pass"
+            )
+            continue
+
+        for char_id in eligible_chars:
             masks = face_tracker.generate_masks(
                 chunk_frames, aligned_detections, char_id, video_file=args.input
             )
@@ -660,6 +698,7 @@ def process_movie(args):
             "overlap_seconds": args.overlap_seconds,
             "num_chunks": len(chunks),
             "num_multi_speaker_chunks": len(multi_speaker_chunks),
+            "min_face_detections": args.min_face_detections,
             "pass0_time_seconds": round(t_pass0, 1),
             "pass1_time_seconds": round(t_pass1, 1),
             "pass2_time_seconds": round(t_pass2, 1),
@@ -732,6 +771,12 @@ def main():
     parser.add_argument("--no-judge", action="store_true", help="Skip Judge scoring")
     parser.add_argument(
         "--no-sam3", action="store_true", help="Use bbox masks instead of SAM3"
+    )
+    parser.add_argument(
+        "--min-face-detections",
+        type=int,
+        default=3,
+        help="Min face detections per character per chunk to run visual pass (default: 3)",
     )
     parser.add_argument(
         "--face-det-threshold",
