@@ -170,29 +170,50 @@ Per-character time halved (2x), but more chunks means same characters appear in 
 
 **Quality tradeoff**: Dialogue detection dropped from 41.0% to 36.8%. Needs investigation — may be due to shorter context making ambiguous speech harder to identify, or more overlap boundary effects.
 
-### Round 5: Min Visibility Threshold (current)
+### Round 5: Min Visibility Threshold (commit d06e2b4)
 
 Added `--min-face-detections` (default 3). Characters with fewer than N face detections in a chunk window are skipped from the expensive `model.separate()` call. If fewer than 2 characters remain eligible, the entire chunk's visual pass is skipped.
 
 Rationale: A character with 1-2 face detections in a 90s window (= 2-4 seconds of visibility at 2s sampling interval) is likely a brief appearance. Running a full 75s `model.separate()` call for such fleeting appearances is wasteful.
 
-Also stores `char_detection_counts` per chunk in the output metadata for analysis.
+| Metric | R4 (no filter) | R5 (min_face_detections=3) | Change |
+|--------|---------------|---------------------------|--------|
+| Pass 0 | 20 min | 19.6 min | Same |
+| Pass 1 | 27.5 min | 27.5 min | Same |
+| Pass 2 | 257 min | **149 min** | **-42%** |
+| **Total** | **305 min (5.1h)** | **197 min (3.3h)** | **-36%** |
+| Char-chunks | 207 | 130 eligible / 197 total | -37% |
+| Dialogue % | 36.8% | 33.1% | -10% relative |
 
-**Estimated impact**: Even a 20% reduction in char-chunks (207 -> ~165) saves ~50 minutes of Pass 2 time at 75s/char.
+Pass 2 dropped from 257 min to 149 min — closely matching the 34% char-chunk reduction (130/197). Some chunks were skipped entirely when fewer than 2 characters remained eligible after filtering.
+
+**Cumulative speedup from R1 baseline: 6.5h -> 3.3h (49% reduction).**
+
+Dialogue detection dropped further (33.1% vs 36.8% in R4). This additional drop may be from skipping low-visibility characters who were speaking off-screen, or from chunks being skipped entirely when filtering leaves < 2 eligible characters. Needs investigation to determine if this is real lost dialogue or noise reduction.
 
 ## Performance Profile (A100 80GB, Aliens 2h17m)
 
-Best known configuration (90s windows):
+Best known configuration (90s windows, min_face_detections=3):
 
 | Phase | Time | Bottleneck |
 |-------|------|------------|
 | Pass 0: Face detection | 20 min | CPU (InsightFace without CUDA provider) |
 | Pass 0: Clustering | 2 sec | CPU (sklearn) |
 | Pass 1: Text-only | 27.5 min | GPU (model.separate x 97 chunks) |
-| Pass 2: Visual separation | ~257 min | GPU (model.separate x ~207 char-chunks) |
-| **Total** | **~305 min (5.1h)** | |
+| Pass 2: Visual separation | 149 min | GPU (model.separate x 130 eligible char-chunks) |
+| **Total** | **197 min (3.3h)** | |
 
 VRAM usage: ~57 GB of 80 GB for single character separation.
+
+### Optimization Progress
+
+| Round | Total Time | Pass 2 Time | Key Change |
+|-------|-----------|-------------|------------|
+| R1 (baseline) | 6h 33min | 5h 45min | — |
+| R2 (range API) | ~10h | ~9h | REGRESSION: decoded all frames |
+| R3 (batch API) | 6h 30min | 5h 45min | No effect: wrong bottleneck |
+| R4 (90s windows) | 5h 6min | 4h 17min | O(n^2) attention reduction |
+| R5 (min visibility) | **3h 17min** | **2h 29min** | Skip low-detection characters |
 
 ## Remaining Optimization Opportunities
 
@@ -232,4 +253,4 @@ The model supports batch processing, but VRAM is already at ~57/80 GB for single
 
 4. **torchcodec API matters**: `get_frames_played_in_range()` decodes every frame sequentially (expensive for sparse sampling). `get_frames_played_at(timestamps)` only decodes requested frames. Wrong API choice caused a 55% regression.
 
-5. **Quality-speed tradeoffs need measurement**: Shorter windows improved speed 22% but reduced dialogue detection from 41% to 37%. Whether this is acceptable depends on whether R3 had false positives or R4 has false negatives — needs manual scene comparison.
+5. **Quality-speed tradeoffs need measurement**: Optimizations reduced dialogue detection from 41% (R1) to 37% (R4) to 33% (R5). The cumulative 8pp drop needs manual scene comparison to determine if R1 had false positives or R5 has false negatives. The min-visibility filter may skip characters speaking off-screen.
