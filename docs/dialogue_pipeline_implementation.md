@@ -203,6 +203,26 @@ R6 confirms: the R5→R6 dialogue difference (31.4% vs 33.6%) is purely model no
 
 **Cumulative speedup from R1 baseline: 6.5h -> 3.3h (49% reduction).**
 
+### Round 7: Flash Attention Mask Skip (no commit — negative result)
+
+Added `and not key_padding_mask.all()` to the attention mask condition in `Attention.forward()` (`transformer.py:155`). When the padding mask is trivially all-True (batch_size=1, no padding), `attn_mask=None` is passed to `F.scaled_dot_product_attention`, which should allow PyTorch SDPA to dispatch to FlashAttention2 instead of the math backend.
+
+| Metric | R6 | R7 | Notes |
+|--------|----|----|-------|
+| Pass 0 | 20 min | 19.9 min | Same |
+| Pass 1 | 27.5 min | 27.3 min | Same |
+| Pass 2 | 156 min | 159 min | Same (per-char ~68.7s vs ~68.3s) |
+| **Total** | **203 min (3.4h)** | **206 min (3.4h)** | |
+| Multi-speaker chunks | 67 | 67 | Same clustering this run |
+| Eligible char-chunks | 137/212 | 139/212 | +2 |
+| Dialogue % | 33.6% | 34.2% | +0.6pp (within ±2pp noise) |
+
+**Result: No speedup.** The mask skip is correct but insufficient. The real blocker is that **the model runs in float32**. FlashAttention2 requires float16 or bfloat16 — with float32, PyTorch SDPA always uses the math backend regardless of whether `attn_mask` is None or not.
+
+To actually enable flash attention, the model would need `model.half()` or `model.bfloat16()`, or inference under `torch.autocast`. This would be a separate, higher-risk change requiring validation that half-precision doesn't degrade separation quality.
+
+The code change is kept as it's harmless (avoids constructing a redundant mask tensor), but it alone provides no performance benefit.
+
 ## Performance Profile (A100 80GB, Aliens 2h17m)
 
 Best known configuration (90s windows, min_face_detections=3):
@@ -227,6 +247,7 @@ VRAM usage: ~57 GB of 80 GB for single character separation.
 | R4 (90s windows) | 5h 6min | 4h 17min | ~37%* | O(n^2) attention reduction |
 | R5 (min visibility) | 3h 17min | 2h 29min | 31.4%** | Skip low-detection characters |
 | R6 (dedup fix) | **3h 23min** | **2h 36min** | **33.6%** | Fix overlap double-counting |
+| R7 (flash attn mask) | 3h 26min | 2h 39min | 34.2% | No effect: model uses float32 |
 
 \* R1-R4 values inflated by overlap double-counting bug (fixed in R6).
 \*\* R5 reported 33.1% but was 31.4% after manual dedup correction.
@@ -247,9 +268,9 @@ Audio codec encoding and T5 text encoding are identical for all characters in a 
 
 Install `onnxruntime-gpu` for CUDA-based InsightFace. Would reduce Pass 0 from 20 min to ~2 min. Small impact on total but meaningful for iteration speed.
 
-### 4. Flash attention (high potential impact)
+### 4. Flash attention via half-precision inference (high potential impact)
 
-The DiT transformer in `model.py` doesn't use flash attention. Enabling it could significantly reduce the ODE solver's O(n^2) attention cost, especially on long sequences.
+R7 confirmed that removing the attention mask alone doesn't help — the model runs in float32, and FlashAttention2 requires float16/bfloat16. To unlock flash attention, the model needs `model.bfloat16()` or `torch.autocast('cuda', dtype=torch.bfloat16)`. This could significantly reduce the ODE solver's O(n^2) attention cost but requires validating that half-precision doesn't degrade separation quality.
 
 ### 5. Pre-compute vision features (high complexity)
 

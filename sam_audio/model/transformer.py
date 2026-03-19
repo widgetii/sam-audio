@@ -152,7 +152,7 @@ class Attention(nn.Module):
 
         attn_mask = None
 
-        if key_padding_mask is not None:
+        if key_padding_mask is not None and not key_padding_mask.all():
             attn_mask = key_padding_mask[:, None, None, :]
 
         output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask)
