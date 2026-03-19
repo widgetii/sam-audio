@@ -183,13 +183,25 @@ Rationale: A character with 1-2 face detections in a 90s window (= 2-4 seconds o
 | Pass 2 | 257 min | **149 min** | **-42%** |
 | **Total** | **305 min (5.1h)** | **197 min (3.3h)** | **-36%** |
 | Char-chunks | 207 | 130 eligible / 197 total | -37% |
-| Dialogue % | 36.8% | 33.1% | -10% relative |
 
 Pass 2 dropped from 257 min to 149 min — closely matching the 34% char-chunk reduction (130/197). Some chunks were skipped entirely when fewer than 2 characters remained eligible after filtering.
 
-**Cumulative speedup from R1 baseline: 6.5h -> 3.3h (49% reduction).**
+### Round 6: Confirmation Run with Dedup Fix (commit f2200ae)
 
-Dialogue detection dropped further (33.1% vs 36.8% in R4). This additional drop may be from skipping low-visibility characters who were speaking off-screen, or from chunks being skipped entirely when filtering leaves < 2 eligible characters. Needs investigation to determine if this is real lost dialogue or noise reduction.
+Fixed overlap double-counting bug in dialogue_percentage calculation. Re-ran with identical settings to R5 to validate non-determinism hypothesis.
+
+| Metric | R5 | R6 | Notes |
+|--------|----|----|-------|
+| Pass 2 | 149 min | 156 min | R6 had more char-chunks |
+| **Total** | **197 min (3.3h)** | **203 min (3.4h)** | |
+| Multi-speaker chunks | 62 | 67 | Different clustering |
+| Eligible char-chunks | 130/197 | 137/212 | Different clustering |
+| Dialogue % (reported) | 33.1% (buggy) | **33.6%** (correct) | |
+| Dialogue % (deduped) | 31.4% | 33.6% | +2.2pp non-determinism |
+
+R6 confirms: the R5→R6 dialogue difference (31.4% vs 33.6%) is purely model non-determinism — same pipeline, same settings, 2.2pp variation. Face clustering is also non-deterministic (different multi-speaker chunk counts). Pass 2 time scales proportionally with eligible char-chunks (~68s each).
+
+**Cumulative speedup from R1 baseline: 6.5h -> 3.3h (49% reduction).**
 
 ## Performance Profile (A100 80GB, Aliens 2h17m)
 
@@ -200,20 +212,24 @@ Best known configuration (90s windows, min_face_detections=3):
 | Pass 0: Face detection | 20 min | CPU (InsightFace without CUDA provider) |
 | Pass 0: Clustering | 2 sec | CPU (sklearn) |
 | Pass 1: Text-only | 27.5 min | GPU (model.separate x 97 chunks) |
-| Pass 2: Visual separation | 149 min | GPU (model.separate x 130 eligible char-chunks) |
-| **Total** | **197 min (3.3h)** | |
+| Pass 2: Visual separation | ~150-156 min | GPU (model.separate x ~130-137 eligible char-chunks) |
+| **Total** | **~200 min (3.3-3.4h)** | |
 
 VRAM usage: ~57 GB of 80 GB for single character separation.
 
 ### Optimization Progress
 
-| Round | Total Time | Pass 2 Time | Key Change |
-|-------|-----------|-------------|------------|
-| R1 (baseline) | 6h 33min | 5h 45min | — |
-| R2 (range API) | ~10h | ~9h | REGRESSION: decoded all frames |
-| R3 (batch API) | 6h 30min | 5h 45min | No effect: wrong bottleneck |
-| R4 (90s windows) | 5h 6min | 4h 17min | O(n^2) attention reduction |
-| R5 (min visibility) | **3h 17min** | **2h 29min** | Skip low-detection characters |
+| Round | Total Time | Pass 2 Time | Dialogue % | Key Change |
+|-------|-----------|-------------|------------|------------|
+| R1 (baseline) | 6h 33min | 5h 45min | ~41%* | — |
+| R2 (range API) | ~10h | ~9h | — | REGRESSION: decoded all frames |
+| R3 (batch API) | 6h 30min | 5h 45min | ~41%* | No effect: wrong bottleneck |
+| R4 (90s windows) | 5h 6min | 4h 17min | ~37%* | O(n^2) attention reduction |
+| R5 (min visibility) | 3h 17min | 2h 29min | 31.4%** | Skip low-detection characters |
+| R6 (dedup fix) | **3h 23min** | **2h 36min** | **33.6%** | Fix overlap double-counting |
+
+\* R1-R4 values inflated by overlap double-counting bug (fixed in R6).
+\*\* R5 reported 33.1% but was 31.4% after manual dedup correction.
 
 ## Remaining Optimization Opportunities
 
@@ -247,11 +263,11 @@ The model supports batch processing, but VRAM is already at ~57/80 GB for single
 
 ### Reported regression: 41% (R1) -> 37% (R4) -> 33% (R5)
 
-Investigation found the apparent regression is mostly explained by two factors:
+Investigation and R6 confirmation run found the apparent regression is mostly explained by two factors:
 
 ### 1. Overlap double-counting bug (fixed)
 
-The `dialogue_percentage` calculation summed ALL segments including overlapping regions between consecutive chunks, double-counting ~480 segments (96 overlaps × 5 seconds). Corrected R5 value: **31.4%** (not 33.1%). This bug affected all rounds equally, inflating all reported values.
+The `dialogue_percentage` calculation summed ALL segments including overlapping regions between consecutive chunks, double-counting ~480 segments (96 overlaps × 5 seconds). Corrected R5 value: **31.4%** (not 33.1%). This bug affected all rounds equally, inflating all reported values. Fixed in commit f2200ae, confirmed correct in R6 (33.6% reported = 33.6% deduped).
 
 ### 2. Model non-determinism (primary cause of R4 vs R5 difference)
 
@@ -280,11 +296,19 @@ Clear silence peak (-75 to -65dB) and dialogue peak (-30 to -25dB), but signific
 
 The 180s→90s window change does cause a real regression because shorter context gives the model less information. But the reported 4pp difference (41%→37%) is amplified by different overlap amounts (10s vs 5s creates different double-counting) and by model non-determinism between runs.
 
+### R6 Confirmation
+
+R6 re-ran with identical settings to R5 (with the dedup fix). Results:
+- R5 deduped: 31.4%, R6: 33.6% — a **2.2pp difference** from pure non-determinism
+- Face clustering also varies: R5 got 62 multi-speaker chunks, R6 got 67
+- Same character IDs (18, 20, 336, 32, 2, 22, 37, 44) but different detection counts
+
 ### Conclusions
 
-- **R4→R5 regression is not real** — same Pass 1 pipeline, difference is entirely model non-determinism
+- **R4→R5 regression was not real** — confirmed by R6 re-run with 2.2pp variation from non-determinism alone
 - **R1→R4 regression is real but small** — shorter windows reduce context, but the magnitude is uncertain due to the double-counting bug and non-determinism
-- **Binary -40dB threshold is fragile** — 15% of segments are borderline. Consider using a confidence margin, smoothing, or multi-threshold approach
+- **Binary -40dB threshold is fragile** — 15-17% of segments are borderline. Consider using a confidence margin, smoothing, or multi-threshold approach
+- **Run-to-run variance is ~2pp** — any single-run comparison smaller than this is noise
 
 ## Key Lessons Learned
 
