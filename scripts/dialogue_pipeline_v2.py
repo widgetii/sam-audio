@@ -16,6 +16,7 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torchaudio
 from tqdm import tqdm
@@ -157,6 +158,96 @@ def extract_chunk_frames(
         ).to(frames.dtype)
 
     return frames
+
+
+# --- Face detection cache ---
+
+
+def _save_face_cache(
+    path: Path,
+    all_detections: list[list],
+    sample_timestamps: list[float],
+    sample_shot_indices: list[int],
+    profiles: dict,
+):
+    """Save face detection results to disk for fast resume."""
+    import pickle
+
+    import numpy as np
+
+    data = {
+        "sample_timestamps": np.array(sample_timestamps, dtype=np.float64),
+        "sample_shot_indices": np.array(sample_shot_indices, dtype=np.int32),
+    }
+
+    # Serialize detections: flatten into parallel arrays
+    det_frame_ids = []  # which frame each detection belongs to
+    det_bboxes = []
+    det_embeddings = []
+    det_confidences = []
+    det_frame_indices = []
+    det_timestamps = []
+    det_character_ids = []
+    det_shot_indices = []
+
+    for frame_i, frame_dets in enumerate(all_detections):
+        for det in frame_dets:
+            det_frame_ids.append(frame_i)
+            det_bboxes.append(list(det.bbox))
+            det_embeddings.append(det.embedding)
+            det_confidences.append(det.confidence)
+            det_frame_indices.append(det.frame_index)
+            det_timestamps.append(getattr(det, "timestamp", -1.0))
+            det_character_ids.append(det.character_id)
+            det_shot_indices.append(getattr(det, "shot_index", -1))
+
+    data["num_frames"] = len(all_detections)
+    if det_embeddings:
+        data["det_frame_ids"] = np.array(det_frame_ids, dtype=np.int32)
+        data["det_bboxes"] = np.array(det_bboxes, dtype=np.int32)
+        data["det_embeddings"] = np.stack(det_embeddings)
+        data["det_confidences"] = np.array(det_confidences, dtype=np.float32)
+        data["det_frame_indices"] = np.array(det_frame_indices, dtype=np.int32)
+        data["det_timestamps"] = np.array(det_timestamps, dtype=np.float64)
+        data["det_character_ids"] = np.array(det_character_ids, dtype=np.int32)
+        data["det_shot_indices"] = np.array(det_shot_indices, dtype=np.int32)
+
+    # Serialize profiles
+    data["profiles_pickle"] = np.void(pickle.dumps(profiles))
+
+    np.savez_compressed(path, **data)
+
+
+def _load_face_cache(path: Path):
+    """Load cached face detection results."""
+    import pickle
+
+    from character_profile import FaceDetection
+
+    data = dict(np.load(str(path), allow_pickle=True))
+
+    sample_timestamps = data["sample_timestamps"].tolist()
+    sample_shot_indices = data["sample_shot_indices"].tolist()
+
+    num_frames = int(data["num_frames"])
+    all_detections: list[list[FaceDetection]] = [[] for _ in range(num_frames)]
+
+    if "det_embeddings" in data:
+        for i in range(len(data["det_frame_ids"])):
+            det = FaceDetection(
+                bbox=tuple(data["det_bboxes"][i].tolist()),
+                embedding=data["det_embeddings"][i],
+                confidence=float(data["det_confidences"][i]),
+                frame_index=int(data["det_frame_indices"][i]),
+                timestamp=float(data["det_timestamps"][i]),
+                character_id=int(data["det_character_ids"][i]),
+                shot_index=int(data["det_shot_indices"][i]),
+            )
+            all_detections[int(data["det_frame_ids"][i])].append(det)
+
+    profiles = pickle.loads(bytes(data["profiles_pickle"]))
+
+    return all_detections, sample_timestamps, sample_shot_indices, profiles
 
 
 # --- Resume support ---
@@ -358,31 +449,52 @@ def process_movie(args):
     logger.info("=== Stage 1: Dense Face Detection + Clustering ===")
     t_stage1_start = time.time()
 
+    face_cache_path = workspace / "face_detections.npz"
+    video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
+    fps = video_decoder.metadata.average_fps_from_header
+
     face_tracker = FaceTracker(
         sam3_predictor=None,  # SAM3 loaded later if needed
         det_threshold=args.face_det_threshold,
         cluster_threshold=args.cluster_threshold,
     )
 
-    video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
-    fps = video_decoder.metadata.average_fps_from_header
-
-    # Shot-aware face detection: 0.5s interval, min 2 frames per shot
-    all_detections, sample_timestamps, sample_shot_indices = (
-        face_tracker.detect_faces_for_shots(
-            video_decoder,
-            shots,
-            sample_interval=args.sample_interval,
-            min_frames_per_shot=2,
-            batch_size=32,
+    if face_cache_path.exists() and args.resume:
+        logger.info(f"Loading cached face detections from {face_cache_path}")
+        all_detections, sample_timestamps, sample_shot_indices, profiles = (
+            _load_face_cache(face_cache_path)
         )
-    )
+        profiles = dict(list(profiles.items())[: args.max_characters])
+        logger.info(
+            f"Loaded {len(all_detections)} frames, {len(profiles)} characters from cache"
+        )
+    else:
+        # Shot-aware face detection: 0.5s interval, min 2 frames per shot
+        all_detections, sample_timestamps, sample_shot_indices = (
+            face_tracker.detect_faces_for_shots(
+                video_decoder,
+                shots,
+                sample_interval=args.sample_interval,
+                min_frames_per_shot=2,
+                batch_size=32,
+            )
+        )
 
-    # Cluster into character profiles
-    logger.info("Clustering faces into characters")
-    profiles = face_tracker.cluster_to_profiles(all_detections)
-    profiles = dict(list(profiles.items())[: args.max_characters])
-    logger.info(f"Found {len(profiles)} characters")
+        # Cluster into character profiles
+        logger.info("Clustering faces into characters")
+        profiles = face_tracker.cluster_to_profiles(all_detections)
+        profiles = dict(list(profiles.items())[: args.max_characters])
+        logger.info(f"Found {len(profiles)} characters")
+
+        # Cache to disk
+        _save_face_cache(
+            face_cache_path,
+            all_detections,
+            sample_timestamps,
+            sample_shot_indices,
+            profiles,
+        )
+        logger.info(f"Cached face detections to {face_cache_path}")
 
     # Assign detected characters to shots
     for frame_dets, shot_idx in zip(all_detections, sample_shot_indices, strict=False):
