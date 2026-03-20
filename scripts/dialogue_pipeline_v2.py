@@ -131,15 +131,32 @@ def extract_chunk_frames(
     end_sec: float,
     fps: float,
     max_frames: int = 150,
+    max_height: int = 480,
 ) -> torch.Tensor:
-    """Extract video frames for a time range."""
+    """Extract video frames for a time range, downscaled for VRAM efficiency.
+
+    The SAMAudioProcessor resamples frames to the audio token count (25/sec),
+    so a 90s chunk produces 2250 frames. At 1080p that's ~53GB — must downscale.
+    """
     duration = end_sec - start_sec
     num_frames = min(int(duration * fps), max_frames)
     if num_frames <= 0:
         num_frames = 1
     timestamps = [start_sec + i * duration / num_frames for i in range(num_frames)]
     batch = video_decoder.get_frames_played_at(timestamps)
-    return batch.data
+    frames = batch.data  # [N, C, H, W]
+
+    # Downscale if needed to avoid OOM in vision encoder
+    _, _, h, w = frames.shape
+    if h > max_height:
+        scale = max_height / h
+        new_h = max_height
+        new_w = int(w * scale)
+        frames = torch.nn.functional.interpolate(
+            frames.float(), size=(new_h, new_w), mode="bilinear", align_corners=False
+        ).to(frames.dtype)
+
+    return frames
 
 
 # --- Resume support ---
@@ -517,7 +534,11 @@ def process_movie(args):
         chunk_audio = full_audio[:, start_sample:end_sample]
 
         chunk_frames = extract_chunk_frames(
-            video_decoder, chunk_meta["start_time"], chunk_meta["end_time"], fps
+            video_decoder,
+            chunk_meta["start_time"],
+            chunk_meta["end_time"],
+            fps,
+            max_frames=150,
         )
 
         # Get detections aligned to chunk frames
