@@ -22,6 +22,12 @@ class VoiceTracker:
         """Lazy-load the ECAPA-TDNN model."""
         if self._model is not None:
             return
+
+        # SpeechBrain calls torchaudio.list_audio_backends() on import,
+        # which was removed in newer torchaudio versions. Patch if missing.
+        if not hasattr(torchaudio, "list_audio_backends"):
+            torchaudio.list_audio_backends = lambda: ["soundfile"]
+
         from speechbrain.inference.speaker import EncoderClassifier
 
         logger.info("Loading ECAPA-TDNN speaker encoder")
