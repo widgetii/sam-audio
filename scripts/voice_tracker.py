@@ -1,4 +1,4 @@
-"""Voice fingerprinting using ECAPA-TDNN speaker embeddings."""
+"""Voice fingerprinting using Resemblyzer d-vector speaker embeddings."""
 
 import logging
 import math
@@ -12,74 +12,46 @@ logger = logging.getLogger(__name__)
 
 
 class VoiceTracker:
-    """Extract and manage speaker voice embeddings using ECAPA-TDNN."""
+    """Extract and manage speaker voice embeddings using Resemblyzer."""
 
     def __init__(self, device: torch.device | None = None):
         self.device = device or torch.device("cpu")
-        self._model = None
+        self._encoder = None
 
     def _load_model(self):
-        """Lazy-load the ECAPA-TDNN model."""
-        if self._model is not None:
+        """Lazy-load the Resemblyzer voice encoder."""
+        if self._encoder is not None:
             return
+        from resemblyzer import VoiceEncoder
 
-        # SpeechBrain calls torchaudio.list_audio_backends() on import,
-        # which was removed in newer torchaudio versions. Patch if missing.
-        if not hasattr(torchaudio, "list_audio_backends"):
-            torchaudio.list_audio_backends = lambda: ["soundfile"]
-
-        # SpeechBrain 1.0.x uses deprecated use_auth_token kwarg for
-        # hf_hub_download which was removed in newer huggingface_hub.
-        # Patch it to accept and ignore the old kwarg.
-        import functools
-
-        import huggingface_hub
-
-        _orig_download = huggingface_hub.hf_hub_download
-
-        @functools.wraps(_orig_download)
-        def _patched_download(*args, **kwargs):
-            kwargs.pop("use_auth_token", None)
-            return _orig_download(*args, **kwargs)
-
-        huggingface_hub.hf_hub_download = _patched_download
-
-        from speechbrain.inference.speaker import EncoderClassifier
-
-        logger.info("Loading ECAPA-TDNN speaker encoder")
-        self._model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": str(self.device)},
-        )
+        logger.info("Loading Resemblyzer voice encoder")
+        self._encoder = VoiceEncoder(device=str(self.device))
 
     def extract_embedding(
         self,
         audio: torch.Tensor,
         sample_rate: int = 48000,
-        target_rate: int = 16000,
     ) -> np.ndarray | None:
-        """Extract a 192-dim speaker embedding from audio.
+        """Extract a 256-dim speaker embedding from audio.
 
         Args:
             audio: Audio tensor [1, samples] or [samples].
             sample_rate: Input sample rate.
-            target_rate: ECAPA-TDNN expects 16kHz.
 
         Returns:
-            192-dim numpy embedding, or None if audio too short/quiet.
+            256-dim numpy embedding, or None if audio too short/quiet.
         """
         self._load_model()
 
-        if audio.ndim == 1:
-            audio = audio.unsqueeze(0)
+        if audio.ndim == 2:
+            audio = audio.squeeze(0)
 
-        # Resample to 16kHz
-        if sample_rate != target_rate:
-            audio = torchaudio.functional.resample(audio, sample_rate, target_rate)
+        # Resample to 16kHz (Resemblyzer requirement)
+        if sample_rate != 16000:
+            audio = torchaudio.functional.resample(audio, sample_rate, 16000)
 
         # Minimum 0.5s of audio
-        min_samples = target_rate // 2
-        if audio.shape[-1] < min_samples:
+        if audio.shape[-1] < 8000:
             return None
 
         # Check RMS — skip if too quiet
@@ -87,9 +59,15 @@ class VoiceTracker:
         if rms < 1e-5:
             return None
 
-        with torch.inference_mode():
-            embedding = self._model.encode_batch(audio.to(self.device))
-            return embedding.squeeze().cpu().numpy()
+        wav = audio.float().cpu().numpy()
+        from resemblyzer import preprocess_wav
+
+        wav = preprocess_wav(wav, source_sr=16000)
+        if len(wav) < 8000:
+            return None
+
+        embedding = self._encoder.embed_utterance(wav)
+        return embedding
 
     def extract_from_separation(
         self,
@@ -102,15 +80,6 @@ class VoiceTracker:
 
         Only extracts if the separation quality is good enough
         (target significantly louder than residual).
-
-        Args:
-            target_audio: Separated target audio [1, samples].
-            residual_audio: Residual audio [1, samples].
-            sample_rate: Audio sample rate.
-            min_target_to_residual_db: Minimum dB difference for quality gate.
-
-        Returns:
-            192-dim embedding or None if quality too low.
         """
         t_rms = _rms_db(target_audio)
         r_rms = _rms_db(residual_audio)
