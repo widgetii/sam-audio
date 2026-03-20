@@ -304,7 +304,7 @@ def process_movie(args):
     # STAGE 0: Shot Boundary Detection
     # ================================================================
     from scene_detector import (
-        detect_shots_av1an,
+        detect_shots,
         generate_scene_chunks,
         group_shots_into_scenes,
         propagate_characters,
@@ -327,7 +327,7 @@ def process_movie(args):
         shots = load_shots_from_json(str(shots_json), args.input)
         logger.info(f"Resumed {len(shots)} shots from {shots_json}")
     else:
-        shots = detect_shots_av1an(args.input, str(shots_json))
+        shots = detect_shots(args.input, str(shots_json))
 
     t_stage0 = time.time() - t_stage0_start
     logger.info(f"Stage 0 complete: {len(shots)} shots in {t_stage0:.1f}s")
