@@ -28,6 +28,22 @@ class VoiceTracker:
         if not hasattr(torchaudio, "list_audio_backends"):
             torchaudio.list_audio_backends = lambda: ["soundfile"]
 
+        # SpeechBrain 1.0.x uses deprecated use_auth_token kwarg for
+        # hf_hub_download which was removed in newer huggingface_hub.
+        # Patch it to accept and ignore the old kwarg.
+        import functools
+
+        import huggingface_hub
+
+        _orig_download = huggingface_hub.hf_hub_download
+
+        @functools.wraps(_orig_download)
+        def _patched_download(*args, **kwargs):
+            kwargs.pop("use_auth_token", None)
+            return _orig_download(*args, **kwargs)
+
+        huggingface_hub.hf_hub_download = _patched_download
+
         from speechbrain.inference.speaker import EncoderClassifier
 
         logger.info("Loading ECAPA-TDNN speaker encoder")
