@@ -4,7 +4,50 @@
 
 End-to-end movie dialogue extraction pipeline using SAM-Audio with visual prompting for per-character speech isolation. Processes full-length movies (tested on "Aliens" 1986, 2h17m) on A100 80GB GPU.
 
-## Architecture
+Two pipeline versions exist:
+- **v1** (`scripts/dialogue_metadata.py`): Fixed 90s windows, face-only identity. Working baseline, ~3.3h on A100.
+- **v2** (`scripts/dialogue_pipeline_v2.py`): Scene-aware chunking, multi-modal identity (face + voice). Addresses the Burke detection problem.
+
+## Architecture — v2 (Scene-Aware Multi-Modal)
+
+```
+Movie file (mkv/mp4, 1080p)
+  |
+  Stage 0: Shot Boundary Detection
+  |  av1an --sc-only -> shot boundaries (camera cuts)
+  |  Output: list of Shot(start, end) — ~1500-3000 per 2h movie
+  |
+  Stage 1: Dense Face Detection + Clustering
+  |  InsightFace every 0.5s (4x denser), 1080p source, det_thresh=0.3
+  |  Global agglomerative clustering -> CharacterProfile IDs
+  |  Output: per-shot character presence with face embeddings
+  |
+  Stage 2: Scene Grouping + Character Propagation
+  |  Group consecutive shots into scenes by character overlap + temporal proximity
+  |  Propagate: if Burke seen in shots 1,5 of scene -> present in shots 2-4 too
+  |  Output: scenes with confirmed character sets (detected + propagated)
+  |
+  Stage 3: Dialogue Detection (scene-aligned chunks)
+  |  SAM-Audio text_only on scene-aligned audio (split at shot boundaries, not arbitrary)
+  |  Identify scenes with dialogue + 2+ characters
+  |
+  Stage 4: Visual Separation + Voice Fingerprinting
+  |  SAM-Audio visual separation per character per scene-chunk
+  |  Extract speaker embeddings (ECAPA-TDNN 192-dim) from separated audio
+  |  Build incremental voice profiles per character
+  |  Voice-based discovery: match unattributed speech to known voice profiles
+  |
+  Stage 5: Reconciliation + Timeline Assembly
+  |  Merge face-only and voice-only character identities
+  |  Assemble per-character speaking timeline (v2 output format)
+  |
+  Output: dialogue_metadata_v2.json
+    - Per-character speaking segments with timestamps
+    - Scene/shot structure
+    - Multi-modal identity sources per character
+```
+
+## Architecture — v1 (Fixed Window)
 
 ```
 Movie file (mkv/mp4)
@@ -37,7 +80,11 @@ Movie file (mkv/mp4)
 
 | File | Purpose |
 |------|---------|
-| `scripts/dialogue_metadata.py` | Main pipeline script (CLI entry point) |
+| `scripts/dialogue_pipeline_v2.py` | **v2** main pipeline script (5-stage, scene-aware) |
+| `scripts/scene_detector.py` | Shot detection (av1an), scene grouping, character propagation |
+| `scripts/voice_tracker.py` | ECAPA-TDNN speaker embedding extraction + voice profiles |
+| `scripts/character_profile.py` | CharacterProfile dataclass, FaceDetection, identity fusion |
+| `scripts/dialogue_metadata.py` | **v1** pipeline script (fixed windows, kept for reference) |
 | `scripts/face_tracker.py` | Face detection, embedding, clustering, mask generation |
 
 ## Key Technical Details
@@ -100,7 +147,68 @@ Uses torchcodec `VideoDecoder` with three APIs:
 
 Progress saved to `{output}.progress.json` after each chunk. Stores `pass1_completed`, `pass2_completed` indices and full results. Essential for multi-hour runs where SSH may timeout.
 
-## CLI Interface
+## v2 Design Rationale
+
+### Problems with v1
+
+1. **Arbitrary chunking**: Fixed 90s windows split mid-scene. No character state flows between chunks.
+2. **Face-only identity**: Character identity relies 100% on InsightFace. When faces are missed (Burke undetected in entire 81:30-83:00 confrontation), the character vanishes from the speaking timeline.
+3. **No voice signal**: The pipeline discards the most reliable identity cue for dialogue — the voice itself.
+
+### Key changes in v2
+
+- **1080p source** (`Aliens.1080p.mkv`) instead of 720x480 DVD — faces are ~6x more pixels before InsightFace downscales.
+- **4x denser sampling** (0.5s vs 2s) — 16,500 frames vs 4,100 for a 2h17m movie.
+- **Lower detection threshold** (`det_thresh=0.3` vs 0.5) — accept more candidates, clustering filters noise.
+- **Shot-aware sampling** — minimum 2 frames per shot, even for 1-second shots.
+- **Scene-aligned chunks** — no arbitrary mid-scene splits, no overlap deduplication needed.
+- **Character propagation** — Burke in shots 1 and 5 of a scene → propagated to shots 2-4.
+- **Voice fingerprinting** — ECAPA-TDNN 192-dim speaker embeddings from clean SAM-Audio separations.
+- **Voice discovery** — unattributed dialogue matched to known voice profiles by cosine similarity.
+
+### Identity fusion
+
+```
+1. Face match exists → use it (high precision)
+2. Face + voice agree → boost confidence
+3. Only voice match → use it (0.8x confidence penalty)
+4. Face and voice disagree → trust face
+5. No match → unknown character placeholder
+```
+
+## CLI Interface — v2
+
+```bash
+uv run python scripts/dialogue_pipeline_v2.py \
+  --input /data/huggingface/Aliens.1080p.mkv \
+  --output aliens_dialogue_v2.json \
+  --workspace ./workspace/v2 \
+  --checkpoint facebook/sam-audio-base-tv \
+  --audio-stream 6 \
+  --face-det-threshold 0.3 \
+  --sample-interval 0.5 \
+  --max-scene-gap 2.0 \
+  --max-scene-duration 300 \
+  --window-seconds 90 \
+  --rms-threshold-db -40 \
+  --max-characters 8 \
+  --voice-quality-threshold 5.0 \
+  --enable-voice-discovery \
+  --no-sam3 \
+  --resume
+```
+
+### Shot detection options
+
+```bash
+# Run av1an locally (if not on GPU machine)
+av1an --sc-only -i /data/huggingface/Aliens.1080p.mkv --scenes shots.json -x 0
+
+# Then pass pre-computed shots to pipeline
+--shots-json shots.json
+```
+
+## CLI Interface — v1
 
 ```bash
 uv run python scripts/dialogue_metadata.py \
@@ -251,6 +359,75 @@ VRAM usage: ~57 GB of 80 GB for single character separation.
 
 \* R1-R4 values inflated by overlap double-counting bug (fixed in R6).
 \*\* R5 reported 33.1% but was 31.4% after manual dedup correction.
+
+## Known Issues
+
+### SAM3 video predictor OOMs on full-length movies
+
+When running with SAM3 mask generation (the default), Pass 2 gets OOM-killed. SAM3's `start_session(resource_path=video_file)` loads all video frames into memory. For a 2h17m movie at 24fps that's ~197K frames — far too much for system RAM.
+
+**Observed**: frame loading reaches ~9% (17K/197K frames), slows from 480 it/s to 1.2 it/s as memory fills, then process is killed by OS. No error in log — silent OOM kill.
+
+**Workaround**: `--no-sam3` flag uses padded bounding box masks instead.
+
+**Possible fixes**:
+1. **Chunk-level sessions** — extract only the chunk's frames (~2160 for 90s at 24fps) to a temp dir, use that as SAM3 resource path
+2. **Frame range API** — if SAM3 supports limiting which frames to load
+3. **Lazy frame loading** — patch SAM3 to stream frames instead of loading all upfront
+
+**References**: `scripts/face_tracker.py:222` (`_generate_sam3_masks`), `scripts/dialogue_metadata.py:370-374` (SAM3 init)
+
+### SAM-Audio produces silence on pre-separated center channel audio
+
+**Experiment** (Round 8): Tried using the English 5.1 center channel (dialogue-only by convention) as SAM-Audio input instead of the full audio mix, combined with visual face prompts for per-character separation.
+
+**Setup**:
+- Extract center channel: `ffmpeg -i movie.mkv -map 0:a:2 -af "pan=mono|c0=FC" -ar 48000 -ac 1 center.wav`
+- Detect faces in 80:00-90:00 window, cluster, generate bbox masks
+- Run SAM-Audio (sam-audio-base-tv) with `masked_video` + center channel audio
+- Transcribe separated audio with faster-whisper
+
+**Result**: SAM-Audio returned near-silence for almost all characters. Out of 8 chunks × ~4 characters each, only **2 lines** survived Whisper transcription. The separated audio energy was below the VAD threshold for >95% of character-chunks.
+
+**Root cause**: SAM-Audio is trained on mixed audio (speech + music + SFX + ambient). Its diffusion model learns to extract a target sound from a complex soundscape. When the input is already a clean dialogue track (center channel), there's minimal non-target signal for the model to suppress. The model appears to interpret the near-absence of "other sounds" as a signal that the target is also absent, producing silence.
+
+**Additional issues encountered**:
+- **Face clustering fragmentation**: 300 frames (2s sampling × 10min) produced 37-143 clusters depending on threshold. CPU-only InsightFace on low-resolution (720×480) video yields inconsistent embeddings across lighting/angle changes.
+- **Cross-scene face matching**: Cosine similarity between face embeddings from different scenes (e.g., reference at 14:20 vs target at 82:00) drops below 0.4, making automated cluster-to-character mapping unreliable.
+
+**Conclusion**: SAM-Audio visual separation requires mixed audio input. For per-character transcription from a clean dialogue track, use word-level Whisper timestamps + speaking timeline attribution instead (see `docs/transcribe_wordlevel.py`).
+
+**Files**: `docs/transcribe_visual_separation.py` (experiment), `docs/transcribe_wordlevel.py` (working alternative)
+
+### InsightFace misses faces in dialogue scenes → characters absent from speaking timeline
+
+**Problem**: Burke (Paul Reiser) speaks extensively in the confrontation scene at 81:30-83:00 but has **zero face detections** in that time range. His speaking timeline jumps from 79:32 straight to 124:40 — a 45-minute gap.
+
+**Evidence from `dialogue_metadata.json`**:
+```
+Chunk 57 (80:45-82:15): visible = [Gorman(1), Ripley(24), Bishop(10), Vasquez(1)]  — no Burke
+Chunk 58 (82:10-83:40): visible = [Ripley(22), Hicks(20)]                          — no Burke
+```
+
+Burke is not detected even once across ~45 sampled frames (90s ÷ 2s interval) in these chunks.
+
+**Impact**: Since Burke has 0 detections, he is excluded from `visible_characters`, SAM-Audio visual separation is never run for him, and he gets no speaking segments. The speaking timeline then has no Burke data for the confrontation scene. Downstream, the word-level transcription script (`transcribe_wordlevel.py`) cannot attribute any words to Burke because there are no Burke speaking segments to match against.
+
+**Likely causes**:
+- Low source resolution (720×480) — faces may be too small for RetinaFace at `det_size=(640,640)`
+- Profile angles, partial occlusion, or motion blur during dialogue
+- InsightFace running CPU-only (no CUDA provider) — uses lower-precision inference
+- `det_thresh=0.5` may be too strict for challenging frames
+- 2s sampling interval may miss frames where Burke is clearly visible
+
+**Potential fixes**:
+1. Lower `det_thresh` (e.g., 0.3) to catch more marginal detections
+2. Increase sampling rate (0.5s instead of 2s) for more frame coverage
+3. Upscale frames before face detection (e.g., 2x super-resolution)
+4. Use a different face detector (e.g., YOLO-Face, MediaPipe) as fallback
+5. Manual character registration: provide reference face crops for characters, then match by embedding similarity without relying on exclusive speaking segments
+
+**References**: `scripts/face_tracker.py:46-82` (detect_faces), `scripts/dialogue_metadata.py:391-415` (Pass 0 face detection loop)
 
 ## Remaining Optimization Opportunities
 

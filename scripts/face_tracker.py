@@ -1,19 +1,14 @@
 """Face detection, embedding, clustering, and mask generation for character tracking."""
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+from character_profile import CharacterProfile, FaceDetection
 from sklearn.cluster import AgglomerativeClustering
 
-
-@dataclass
-class FaceDetection:
-    bbox: tuple[int, int, int, int]  # x1, y1, x2, y2
-    embedding: np.ndarray  # 512-dim ArcFace
-    confidence: float
-    frame_index: int = -1
-    character_id: int = -1  # assigned after clustering
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,7 +25,7 @@ class FaceTracker:
     def __init__(
         self,
         sam3_predictor=None,
-        det_threshold: float = 0.5,
+        det_threshold: float = 0.3,
         cluster_threshold: float = 0.6,
     ):
         import insightface
@@ -314,3 +309,101 @@ class FaceTracker:
         start_frame = max(0, start_frame)
         end_frame = min(len(all_detections), end_frame)
         return all_detections[start_frame:end_frame]
+
+    def detect_faces_for_shots(
+        self,
+        video_decoder,
+        shots: list,
+        sample_interval: float = 0.5,
+        min_frames_per_shot: int = 2,
+        batch_size: int = 32,
+    ) -> list[list[FaceDetection]]:
+        """Detect faces with shot-aware sampling.
+
+        Ensures at least min_frames_per_shot are sampled per shot,
+        even for very short shots.
+
+        Args:
+            video_decoder: torchcodec VideoDecoder instance.
+            shots: List of Shot objects with start_sec/end_sec.
+            sample_interval: Seconds between sample frames.
+            min_frames_per_shot: Minimum frames to sample per shot.
+            batch_size: Batch size for face detection.
+
+        Returns:
+            List of detections per sampled frame (same format as detect_faces).
+        """
+        from tqdm import tqdm
+
+        # Build sample timestamps ensuring coverage per shot
+        sample_timestamps = []
+        sample_shot_indices = []
+        for shot in shots:
+            duration = shot.end_sec - shot.start_sec
+            n_regular = max(1, int(duration / sample_interval))
+            n_frames = max(min_frames_per_shot, n_regular)
+            for j in range(n_frames):
+                t = shot.start_sec + j * duration / n_frames
+                if t < shot.end_sec:
+                    sample_timestamps.append(t)
+                    sample_shot_indices.append(shot.index)
+
+        logger.info(
+            f"Shot-aware sampling: {len(sample_timestamps)} frames "
+            f"from {len(shots)} shots (interval={sample_interval}s, "
+            f"min_per_shot={min_frames_per_shot})"
+        )
+
+        all_detections = []
+        for range_start in tqdm(
+            range(0, len(sample_timestamps), batch_size),
+            desc="Face detection (shot-aware)",
+        ):
+            batch_ts = sample_timestamps[range_start : range_start + batch_size]
+            batch_shot_idx = sample_shot_indices[range_start : range_start + batch_size]
+            batch_result = video_decoder.get_frames_played_at(batch_ts)
+            frames_batch = batch_result.data
+
+            dets = self.detect_faces(
+                frames_batch,
+                frame_indices=list(range(range_start, range_start + len(batch_ts))),
+            )
+
+            # Annotate detections with timestamp and shot index
+            for i, frame_dets in enumerate(dets):
+                for det in frame_dets:
+                    det.timestamp = batch_ts[i]
+                    det.shot_index = batch_shot_idx[i]
+
+            all_detections.extend(dets)
+            del frames_batch, batch_result
+
+        return all_detections, sample_timestamps, sample_shot_indices
+
+    def cluster_to_profiles(
+        self, all_detections: list[list[FaceDetection]]
+    ) -> dict[int, CharacterProfile]:
+        """Cluster face detections into CharacterProfile objects.
+
+        Same clustering as cluster_characters but returns CharacterProfile.
+        """
+        characters = self.cluster_characters(all_detections)
+        profiles = {}
+        for cid, info in characters.items():
+            profile = CharacterProfile(
+                character_id=cid,
+                face_detections_count=info.total_frames,
+                frame_indices=info.frame_indices,
+                identity_sources=["face"],
+            )
+            profile.representative_face_embedding = info.representative_embedding
+
+            # Collect face embeddings for this cluster
+            for frame_dets in all_detections:
+                for det in frame_dets:
+                    if det.character_id == cid:
+                        profile.face_embeddings.append(det.embedding)
+
+            profiles[cid] = profile
+
+        return profiles
