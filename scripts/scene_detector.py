@@ -2,10 +2,12 @@
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +99,18 @@ def detect_shots_av1an(
         "-x",
         "0",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # VSScript embeds the system Python (not the venv) and needs to find the
+    # vapoursynth module. Search user site-packages for all installed Python versions.
+    env = os.environ.copy()
+    user_lib = Path.home() / ".local" / "lib"
+    extra_paths = []
+    if user_lib.exists():
+        for sp in sorted(user_lib.glob("python3.*/site-packages")):
+            if (sp / "vapoursynth").exists() or list(sp.glob("vapoursynth*")):
+                extra_paths.append(str(sp))
+    if extra_paths:
+        env["PYTHONPATH"] = os.pathsep.join(extra_paths + [env.get("PYTHONPATH", "")])
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"av1an failed: {result.stderr}")
 
