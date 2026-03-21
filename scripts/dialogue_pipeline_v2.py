@@ -1,12 +1,13 @@
 """Scene-aware multi-modal dialogue extraction pipeline (v2).
 
-Five-stage pipeline:
+Four-stage pipeline:
   Stage 0: Shot boundary detection (av1an)
-  Stage 1: Dense face detection + clustering (InsightFace, 1080p, 0.5s sampling)
-  Stage 2: Scene grouping + character propagation
-  Stage 3: Dialogue detection (SAM-Audio text_only, scene-aligned chunks)
-  Stage 4: Visual separation + voice fingerprinting (SAM-Audio visual + ECAPA-TDNN)
-  Stage 5: Reconciliation + timeline assembly
+  Stage 1: Scene grouping (shots → scenes → chunks)
+  Stage 2: Dialogue detection (SAM-Audio text_only, scene-aligned chunks)
+  Stage 3: Face scan + character clustering + SAM3 body tracking + visual separation
+           Phase A: keyframe face detection on dialogue chunks → cluster → profiles
+           Phase B: SAM3 multi-object body tracking + SAM-Audio visual separation
+  Stage 4: Reconciliation + timeline assembly
 """
 
 import argparse
@@ -16,7 +17,6 @@ import math
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torchaudio
 from tqdm import tqdm
@@ -160,120 +160,6 @@ def extract_chunk_frames(
     return frames
 
 
-# --- Face detection cache ---
-
-
-def _save_face_cache(
-    path: Path,
-    all_detections: list[list],
-    sample_timestamps: list[float],
-    sample_shot_indices: list[int],
-    profiles: dict,
-    cache_version: int = 2,
-):
-    """Save face detection results to disk for fast resume."""
-    import pickle
-
-    import numpy as np
-
-    data = {
-        "cache_version": np.array(cache_version, dtype=np.int32),
-        "sample_timestamps": np.array(sample_timestamps, dtype=np.float64),
-        "sample_shot_indices": np.array(sample_shot_indices, dtype=np.int32),
-    }
-
-    # Serialize detections: flatten into parallel arrays
-    det_frame_ids = []  # which frame each detection belongs to
-    det_bboxes = []
-    det_embeddings = []
-    det_confidences = []
-    det_frame_indices = []
-    det_timestamps = []
-    det_character_ids = []
-    det_shot_indices = []
-    det_bbox_areas = []
-    det_aspect_ratios = []
-
-    for frame_i, frame_dets in enumerate(all_detections):
-        for det in frame_dets:
-            det_frame_ids.append(frame_i)
-            det_bboxes.append(list(det.bbox))
-            det_embeddings.append(det.embedding)
-            det_confidences.append(det.confidence)
-            det_frame_indices.append(det.frame_index)
-            det_timestamps.append(getattr(det, "timestamp", -1.0))
-            det_character_ids.append(det.character_id)
-            det_shot_indices.append(getattr(det, "shot_index", -1))
-            det_bbox_areas.append(getattr(det, "bbox_area", 0))
-            det_aspect_ratios.append(getattr(det, "aspect_ratio", 0.0))
-
-    data["num_frames"] = len(all_detections)
-    if det_embeddings:
-        data["det_frame_ids"] = np.array(det_frame_ids, dtype=np.int32)
-        data["det_bboxes"] = np.array(det_bboxes, dtype=np.int32)
-        data["det_embeddings"] = np.stack(det_embeddings)
-        data["det_confidences"] = np.array(det_confidences, dtype=np.float32)
-        data["det_frame_indices"] = np.array(det_frame_indices, dtype=np.int32)
-        data["det_timestamps"] = np.array(det_timestamps, dtype=np.float64)
-        data["det_character_ids"] = np.array(det_character_ids, dtype=np.int32)
-        data["det_shot_indices"] = np.array(det_shot_indices, dtype=np.int32)
-        data["det_bbox_areas"] = np.array(det_bbox_areas, dtype=np.int32)
-        data["det_aspect_ratios"] = np.array(det_aspect_ratios, dtype=np.float32)
-
-    # Serialize profiles
-    data["profiles_pickle"] = np.void(pickle.dumps(profiles))
-
-    np.savez_compressed(path, **data)
-
-
-def _load_face_cache(path: Path, expected_version: int = 2):
-    """Load cached face detection results.
-
-    Returns None if cache version doesn't match expected_version.
-    """
-    import pickle
-
-    from character_profile import FaceDetection
-
-    data = dict(np.load(str(path), allow_pickle=True))
-
-    # Check cache version
-    cached_version = int(data["cache_version"]) if "cache_version" in data else 1
-    if cached_version != expected_version:
-        logger.warning(
-            f"Cache version mismatch: found v{cached_version}, "
-            f"expected v{expected_version}. Re-detecting faces."
-        )
-        return None
-
-    sample_timestamps = data["sample_timestamps"].tolist()
-    sample_shot_indices = data["sample_shot_indices"].tolist()
-
-    num_frames = int(data["num_frames"])
-    all_detections: list[list[FaceDetection]] = [[] for _ in range(num_frames)]
-
-    if "det_embeddings" in data:
-        has_areas = "det_bbox_areas" in data
-        has_ratios = "det_aspect_ratios" in data
-        for i in range(len(data["det_frame_ids"])):
-            det = FaceDetection(
-                bbox=tuple(data["det_bboxes"][i].tolist()),
-                embedding=data["det_embeddings"][i],
-                confidence=float(data["det_confidences"][i]),
-                frame_index=int(data["det_frame_indices"][i]),
-                timestamp=float(data["det_timestamps"][i]),
-                character_id=int(data["det_character_ids"][i]),
-                shot_index=int(data["det_shot_indices"][i]),
-                bbox_area=int(data["det_bbox_areas"][i]) if has_areas else 0,
-                aspect_ratio=float(data["det_aspect_ratios"][i]) if has_ratios else 0.0,
-            )
-            all_detections[int(data["det_frame_ids"][i])].append(det)
-
-    profiles = pickle.loads(bytes(data["profiles_pickle"]))
-
-    return all_detections, sample_timestamps, sample_shot_indices, profiles
-
-
 # --- Resume support ---
 
 
@@ -283,8 +169,8 @@ def load_progress(progress_path: Path) -> dict:
             return json.load(f)
     return {
         "stage": 0,
+        "pass2_completed": [],
         "pass3_completed": [],
-        "pass4_completed": [],
         "chunk_results": [],
     }
 
@@ -423,8 +309,8 @@ def process_movie(args):
         if args.resume
         else {
             "stage": 0,
+            "pass2_completed": [],
             "pass3_completed": [],
-            "pass4_completed": [],
             "chunk_results": [],
         }
     )
@@ -439,7 +325,6 @@ def process_movie(args):
         detect_shots,
         generate_scene_chunks,
         group_shots_into_scenes,
-        propagate_characters,
         save_shots_and_scenes,
     )
 
@@ -448,7 +333,6 @@ def process_movie(args):
 
     shots_json = workspace / "shots_av1an.json"
     if args.shots_json and Path(args.shots_json).exists():
-        # User provided pre-computed shot boundaries
         from scene_detector import load_shots_from_json
 
         shots = load_shots_from_json(args.shots_json, args.input)
@@ -465,118 +349,34 @@ def process_movie(args):
     logger.info(f"Stage 0 complete: {len(shots)} shots in {t_stage0:.1f}s")
 
     # ================================================================
-    # STAGE 1: Dense Face Detection + Clustering
+    # STAGE 1: Scene Grouping
     # ================================================================
-    from face_tracker import FaceTracker
-    from torchcodec.decoders import VideoDecoder
-
-    logger.info("=== Stage 1: Dense Face Detection + Clustering ===")
+    logger.info("=== Stage 1: Scene Grouping ===")
     t_stage1_start = time.time()
-
-    face_cache_path = workspace / "face_detections.npz"
-    video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
-    fps = video_decoder.metadata.average_fps_from_header
-
-    face_tracker = FaceTracker(
-        sam3_predictor=None,  # SAM3 loaded in Stage 4
-        det_threshold=args.face_det_threshold,
-        cluster_threshold=args.cluster_threshold,
-    )
-
-    face_cache_version = 2
-    cache_loaded = False
-    if face_cache_path.exists() and args.resume:
-        logger.info(f"Loading cached face detections from {face_cache_path}")
-        cache_result = _load_face_cache(
-            face_cache_path, expected_version=face_cache_version
-        )
-        if cache_result is not None:
-            all_detections, sample_timestamps, sample_shot_indices, profiles = (
-                cache_result
-            )
-            profiles = dict(list(profiles.items())[: args.max_characters])
-            logger.info(
-                f"Loaded {len(all_detections)} frames, {len(profiles)} characters from cache"
-            )
-            cache_loaded = True
-
-    if not cache_loaded:
-        # Shot-aware face detection: 0.5s interval, min 2 frames per shot
-        all_detections, sample_timestamps, sample_shot_indices = (
-            face_tracker.detect_faces_for_shots(
-                video_decoder,
-                shots,
-                sample_interval=args.sample_interval,
-                min_frames_per_shot=2,
-                batch_size=32,
-            )
-        )
-
-        # Quality filter before clustering
-        all_detections = face_tracker.filter_detections(all_detections)
-
-        # Cluster into character profiles (two-phase + renumber)
-        logger.info("Clustering faces into characters")
-        profiles = face_tracker.cluster_to_profiles(all_detections)
-        profiles = dict(list(profiles.items())[: args.max_characters])
-        logger.info(f"Found {len(profiles)} characters")
-
-        # Cache to disk
-        _save_face_cache(
-            face_cache_path,
-            all_detections,
-            sample_timestamps,
-            sample_shot_indices,
-            profiles,
-            cache_version=face_cache_version,
-        )
-        logger.info(f"Cached face detections to {face_cache_path}")
-
-    # Assign detected characters to shots
-    for frame_dets, shot_idx in zip(all_detections, sample_shot_indices, strict=False):
-        shot = shots[shot_idx] if shot_idx < len(shots) else None
-        if shot is None:
-            continue
-        for det in frame_dets:
-            if det.character_id >= 0 and det.character_id in profiles:
-                shot.character_ids.add(det.character_id)
-                shot.face_detections.append(det)
-
-    t_stage1 = time.time() - t_stage1_start
-    logger.info(
-        f"Stage 1 complete: {len(all_detections)} frames processed in {t_stage1:.1f}s"
-    )
-
-    # ================================================================
-    # STAGE 2: Scene Grouping + Character Propagation
-    # ================================================================
-    logger.info("=== Stage 2: Scene Grouping + Character Propagation ===")
-    t_stage2_start = time.time()
 
     scenes = group_shots_into_scenes(
         shots,
         max_gap_sec=args.max_scene_gap,
         max_scene_duration=args.max_scene_duration,
     )
-    propagate_characters(scenes)
     save_shots_and_scenes(shots, scenes, str(shots_scenes_path))
 
-    # Generate scene-aligned chunks
+    # Generate scene-aligned chunks (no character info yet — that comes in Stage 3)
     scene_chunks = generate_scene_chunks(scenes, max_chunk_seconds=args.window_seconds)
 
-    t_stage2 = time.time() - t_stage2_start
+    t_stage1 = time.time() - t_stage1_start
     logger.info(
-        f"Stage 2 complete: {len(scenes)} scenes, "
-        f"{len(scene_chunks)} chunks in {t_stage2:.1f}s"
+        f"Stage 1 complete: {len(scenes)} scenes, "
+        f"{len(scene_chunks)} chunks in {t_stage1:.1f}s"
     )
 
     # ================================================================
-    # STAGE 3: Dialogue Detection (scene-aligned)
+    # STAGE 2: Dialogue Detection (audio-only, no video decode)
     # ================================================================
     from sam_audio import SAMAudio, SAMAudioProcessor
 
-    logger.info("=== Stage 3: Dialogue Detection ===")
-    t_stage3_start = time.time()
+    logger.info("=== Stage 2: Dialogue Detection ===")
+    t_stage2_start = time.time()
 
     model = SAMAudio.from_pretrained(args.checkpoint).eval().to(device)
     processor = SAMAudioProcessor.from_pretrained(args.checkpoint)
@@ -589,10 +389,10 @@ def process_movie(args):
     total_duration = full_audio.shape[-1] / 48000
 
     chunk_results = []
-    completed_indices = set(progress["pass3_completed"])
+    completed_indices = set(progress["pass2_completed"])
     existing_results = {r["chunk_index"]: r for r in progress.get("chunk_results", [])}
 
-    for chunk_info in tqdm(scene_chunks, desc="Stage 3: dialogue detection"):
+    for chunk_info in tqdm(scene_chunks, desc="Stage 2: dialogue detection"):
         idx = chunk_info["chunk_index"]
         if idx in completed_indices:
             chunk_results.append(existing_results[idx])
@@ -618,15 +418,10 @@ def process_movie(args):
             args.rms_threshold_db,
         )
 
-        # Scene-aware character info (from propagation, not just face detection in chunk)
         chunk_meta["scene_id"] = chunk_info["scene_id"]
-        chunk_meta["visible_characters"] = chunk_info["characters"]
-        chunk_meta["needs_visual_pass"] = (
-            len(chunk_info["characters"]) >= 2 and chunk_meta["has_any_dialogue"]
-        )
 
         chunk_results.append(chunk_meta)
-        progress["pass3_completed"].append(idx)
+        progress["pass2_completed"].append(idx)
         progress["chunk_results"] = chunk_results
         save_progress(progress_path, progress)
 
@@ -642,41 +437,141 @@ def process_movie(args):
     for scene in scenes:
         scene.has_dialogue = scene_has_dialogue.get(scene.scene_id, False)
 
-    t_stage3 = time.time() - t_stage3_start
-    logger.info(f"Stage 3 complete: {len(chunk_results)} chunks in {t_stage3:.1f}s")
+    t_stage2 = time.time() - t_stage2_start
+    logger.info(f"Stage 2 complete: {len(chunk_results)} chunks in {t_stage2:.1f}s")
 
     # ================================================================
-    # STAGE 4: Visual Separation + Voice Fingerprinting (SAM3-primary)
+    # STAGE 3: Face Scan + Clustering + SAM3 Tracking + Visual Separation
+    #
+    # Phase A: Load InsightFace on GPU, detect faces on 1 keyframe per
+    #          dialogue chunk (at 480p — same resolution as SAM-Audio).
+    #          Then cluster → character profiles. Unload InsightFace.
+    # Phase B: Load SAM3 on GPU. For multi-speaker chunks, SAM3 body
+    #          tracking + SAM-Audio visual separation.
     # ================================================================
-    from voice_tracker import VoiceTracker
+    from face_tracker import FaceTracker
+    from torchcodec.decoders import VideoDecoder
 
-    logger.info("=== Stage 4: Visual Separation + Voice Fingerprinting ===")
-    t_stage4_start = time.time()
+    logger.info("=== Stage 3: Character Detection + Visual Separation ===")
+    t_stage3_start = time.time()
 
-    voice_tracker = VoiceTracker(device=device)
+    video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
+    fps = video_decoder.metadata.average_fps_from_header
 
-    # SAM3 is required for body tracking
+    # Get video dimensions (full resolution, for SAM3 body box clamping)
+    meta_frame = video_decoder.get_frames_played_at([0.0]).data
+    _, _, frame_height, frame_width = meta_frame.shape
+    del meta_frame
+
+    # --- Phase A: face detection + clustering (InsightFace on GPU) ---
+    face_tracker = FaceTracker(
+        sam3_predictor=None,
+        det_threshold=args.face_det_threshold,
+        cluster_threshold=args.cluster_threshold,
+    )
+
+    dialogue_chunks = [c for c in chunk_results if c["has_any_dialogue"]]
+    logger.info(f"Phase A: scanning {len(dialogue_chunks)} dialogue chunks for faces")
+
+    # Scale factor for converting 480p face bboxes back to full resolution
+    scale_factor = frame_height / 480 if frame_height > 480 else 1.0
+
+    # Detect faces on 1 keyframe per dialogue chunk at 480p
+    chunk_keyframe_dets: dict[int, list] = {}  # chunk_index -> list[FaceDetection]
+    for chunk_meta in tqdm(dialogue_chunks, desc="Stage 3A: face detection"):
+        idx = chunk_meta["chunk_index"]
+        # Pick keyframe at 1/3 into chunk (avoids shot transitions at edges)
+        chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
+        keyframe_t = chunk_meta["start_time"] + chunk_duration / 3
+        # Decode at 480p — same resolution SAM-Audio will use
+        keyframe = extract_chunk_frames(
+            video_decoder,
+            keyframe_t,
+            keyframe_t + 0.01,
+            fps,
+            max_frames=1,
+            max_height=480,
+        )  # [1, C, 480, W]
+
+        dets = face_tracker.detect_faces(keyframe, frame_indices=[0])
+        # Quality filter inline (thresholds scaled for 480p)
+        min_area_480p = int(2500 / (scale_factor**2))  # ~1000 at 480p for 1080p source
+        good_dets = []
+        for det in dets[0]:
+            x1, y1, x2, y2 = det.bbox
+            w, h = x2 - x1, y2 - y1
+            area = w * h
+            ar = w / h if h > 0 else 0.0
+            if area < min_area_480p or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
+                continue
+            # Scale bbox back to full resolution for SAM3 body box prompts
+            det.bbox = (
+                int(x1 * scale_factor),
+                int(y1 * scale_factor),
+                int(x2 * scale_factor),
+                int(y2 * scale_factor),
+            )
+            det.timestamp = keyframe_t
+            det.bbox_area = int(area * scale_factor**2)
+            det.aspect_ratio = round(ar, 3)
+            good_dets.append(det)
+
+        chunk_keyframe_dets[idx] = good_dets
+        del keyframe
+
+    total_face_dets = sum(len(d) for d in chunk_keyframe_dets.values())
+    logger.info(
+        f"Phase A: {total_face_dets} face detections "
+        f"from {len(dialogue_chunks)} keyframes"
+    )
+
+    # Cluster all keyframe face detections → character profiles
+    all_keyframe_dets = [list(dets) for dets in chunk_keyframe_dets.values()]
+    all_keyframe_dets = [d for d in all_keyframe_dets if d]
+
+    if total_face_dets > 0:
+        profiles = face_tracker.cluster_to_profiles(all_keyframe_dets)
+        profiles = dict(list(profiles.items())[: args.max_characters])
+        logger.info(f"Clustered into {len(profiles)} characters")
+    else:
+        profiles = {}
+        logger.warning("No face detections found, skipping visual separation")
+
+    # Build char_id lookup per chunk from keyframe detections
+    for idx, dets in chunk_keyframe_dets.items():
+        char_ids = sorted({d.character_id for d in dets if d.character_id >= 0})
+        for cm in chunk_results:
+            if cm["chunk_index"] == idx:
+                cm["visible_characters"] = char_ids
+                cm["needs_visual_pass"] = len(char_ids) >= 2 and cm["has_any_dialogue"]
+                break
+
+    # Unload InsightFace from GPU before loading SAM3
+    del face_tracker.face_app
+    torch.cuda.empty_cache()
+    logger.info("Unloaded InsightFace, freeing GPU for SAM3")
+
+    # --- Phase B: SAM3 body tracking + SAM-Audio separation ---
     from sam3.model_builder import build_sam3_video_predictor
+    from voice_tracker import VoiceTracker
 
     sam3_predictor = build_sam3_video_predictor()
     face_tracker.sam3 = sam3_predictor
     logger.info("SAM3 video predictor loaded for body tracking")
 
-    # Get video dimensions for SAM3 body box clamping
-    meta_frame = video_decoder.get_frames_played_at([0.0]).data
-    _, _, frame_height, frame_width = meta_frame.shape
-    del meta_frame
+    voice_tracker = VoiceTracker(device=device)
 
     multi_speaker_chunks = [c for c in chunk_results if c.get("needs_visual_pass")]
     logger.info(
-        f"{len(multi_speaker_chunks)} / {len(chunk_results)} chunks need visual pass"
+        f"Phase B: {len(multi_speaker_chunks)} / {len(chunk_results)} "
+        f"chunks need visual separation"
     )
 
-    completed_pass4 = set(progress["pass4_completed"])
+    completed_pass3 = set(progress["pass3_completed"])
 
-    for chunk_meta in tqdm(multi_speaker_chunks, desc="Stage 4: character separation"):
+    for chunk_meta in tqdm(multi_speaker_chunks, desc="Stage 3B: visual separation"):
         idx = chunk_meta["chunk_index"]
-        if idx in completed_pass4:
+        if idx in completed_pass3:
             continue
 
         start_sample = int(chunk_meta["start_time"] * 48000)
@@ -684,21 +579,16 @@ def process_movie(args):
         chunk_audio = full_audio[:, start_sample:end_sample]
 
         eligible_chars = chunk_meta["visible_characters"]
-        if len(eligible_chars) < 2:
-            continue
 
-        # Find best face detection per character in this chunk
-        char_dets = face_tracker.get_best_detection_per_character(
-            all_detections,
-            sample_shot_indices,
-            chunk_meta["start_time"],
-            chunk_meta["end_time"],
-            eligible_chars,
-            sample_timestamps,
-        )
+        # Build character_detections from keyframe dets (already at full resolution)
+        char_dets = {}
+        for det in chunk_keyframe_dets.get(idx, []):
+            cid = det.character_id
+            if cid in eligible_chars:
+                if cid not in char_dets or det.confidence > char_dets[cid].confidence:
+                    char_dets[cid] = det
 
-        if not char_dets:
-            logger.debug(f"Chunk {idx}: no face detections for any character, skipping")
+        if len(char_dets) < 2:
             continue
 
         # Convert chunk times to video frame indices for SAM3
@@ -719,7 +609,7 @@ def process_movie(args):
             logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
             continue
 
-        # Extract frames for SAM-Audio visual separation
+        # Decode frames at 480p for SAM-Audio visual separation
         chunk_frames = extract_chunk_frames(
             video_decoder,
             chunk_meta["start_time"],
@@ -732,15 +622,9 @@ def process_movie(args):
 
         # Run SAM-Audio separation per character using SAM3's body masks
         for char_id, masks in per_char_masks.items():
-            # Resample masks to match chunk_frames count
+            # Temporal resampling: pick nearest mask frame to match chunk_frames
             n_frames = chunk_frames.shape[0]
             if masks.shape[0] != n_frames:
-                masks = torch.nn.functional.interpolate(
-                    masks.permute(1, 0, 2, 3).float(),  # [1, N_mask, H, W]
-                    size=(masks.shape[2], masks.shape[3]),
-                    mode="nearest",
-                ).permute(1, 0, 2, 3)
-                # Temporal resampling: pick nearest mask frame
                 mask_indices = (
                     torch.linspace(0, masks.shape[0] - 1, n_frames).round().long()
                 )
@@ -780,7 +664,7 @@ def process_movie(args):
                 "segments": char_analysis["segments"],
             }
 
-            # Voice fingerprinting: extract speaker embedding from clean separations
+            # Voice fingerprinting
             voice_emb = voice_tracker.extract_from_separation(
                 target_cpu,
                 residual_cpu,
@@ -801,24 +685,24 @@ def process_movie(args):
 
         chunk_meta["character_separation"] = character_segments
 
-        # Voice-based discovery: check for unattributed dialogue
+        # Voice-based discovery
         if args.enable_voice_discovery:
             _voice_discovery_pass(
                 chunk_meta, chunk_audio, voice_tracker, profiles, 48000
             )
 
-        progress["pass4_completed"].append(idx)
+        progress["pass3_completed"].append(idx)
         progress["chunk_results"] = chunk_results
         save_progress(progress_path, progress)
 
-    t_stage4 = time.time() - t_stage4_start
-    logger.info(f"Stage 4 complete in {t_stage4:.1f}s")
+    t_stage3 = time.time() - t_stage3_start
+    logger.info(f"Stage 3 complete in {t_stage3:.1f}s")
 
     # ================================================================
-    # STAGE 5: Reconciliation + Timeline Assembly
+    # STAGE 4: Reconciliation + Timeline Assembly
     # ================================================================
-    logger.info("=== Stage 5: Reconciliation + Timeline Assembly ===")
-    t_stage5_start = time.time()
+    logger.info("=== Stage 4: Reconciliation + Timeline Assembly ===")
+    t_stage4_start = time.time()
 
     timeline = build_timeline(chunk_results, args.min_gap_seconds)
 
@@ -835,15 +719,20 @@ def process_movie(args):
                         if seg["has_dialogue"]:
                             total_speaking += seg["end_time"] - seg["start_time"]
 
+        # Count keyframe detections for this character
+        face_det_count = sum(
+            1
+            for dets in chunk_keyframe_dets.values()
+            for d in dets
+            if d.character_id == cid
+        )
+
         char_stats.append(
             {
                 "id": cid,
                 "name": None,
-                "face_detections": profile.face_detections_count,
+                "face_detections": face_det_count,
                 "voice_samples": len(profile.voice_embeddings),
-                "screen_time_sec": round(
-                    profile.face_detections_count * args.sample_interval, 1
-                ),
                 "speaking_sec": round(total_speaking, 1),
                 "identity_sources": profile.identity_sources,
             }
@@ -861,7 +750,6 @@ def process_movie(args):
                     for seg in cs["segments"]:
                         if seg["has_dialogue"]:
                             segments.append([seg["start_time"], seg["end_time"]])
-        # Merge adjacent
         merged = _merge_segments(segments)
         per_character[str(cid)] = {"segments": merged}
 
@@ -876,7 +764,7 @@ def process_movie(args):
         if seg["has_dialogue"]
     )
 
-    t_stage5 = time.time() - t_stage5_start
+    t_stage4 = time.time() - t_stage4_start
     t_total = time.time() - t_start
 
     # Build scenes summary
@@ -886,17 +774,15 @@ def process_movie(args):
             "start": round(sc.start_sec, 1),
             "end": round(sc.end_sec, 1),
             "num_shots": len(sc.shots),
-            "characters": sorted(sc.confirmed_characters),
             "has_dialogue": sc.has_dialogue,
         }
         for sc in scenes
     ]
 
     metadata = {
-        "version": "2.0",
+        "version": "2.1",
         "source": {
             "file": args.input,
-            "resolution": "1920x1080",
             "duration": round(total_duration, 1),
         },
         "scenes": scenes_summary,
@@ -911,15 +797,14 @@ def process_movie(args):
             "num_shots": len(shots),
             "num_scenes": len(scenes),
             "num_chunks": len(scene_chunks),
+            "num_dialogue_chunks": len(dialogue_chunks),
             "num_multi_speaker_chunks": len(multi_speaker_chunks),
-            "sample_interval": args.sample_interval,
             "face_det_threshold": args.face_det_threshold,
             "stage0_time": round(t_stage0, 1),
             "stage1_time": round(t_stage1, 1),
             "stage2_time": round(t_stage2, 1),
             "stage3_time": round(t_stage3, 1),
             "stage4_time": round(t_stage4, 1),
-            "stage5_time": round(t_stage5, 1),
             "total_time": round(t_total, 1),
         },
         "statistics": {
@@ -1048,19 +933,13 @@ def main():
         "--face-det-threshold",
         type=float,
         default=0.3,
-        help="Face detection confidence threshold (default: 0.3, lowered from v1's 0.5)",
+        help="Face detection confidence threshold",
     )
     parser.add_argument(
         "--cluster-threshold",
         type=float,
         default=0.6,
         help="Face clustering distance threshold",
-    )
-    parser.add_argument(
-        "--sample-interval",
-        type=float,
-        default=0.5,
-        help="Face sampling interval in seconds (default: 0.5, 4x denser than v1)",
     )
 
     # Scene grouping
