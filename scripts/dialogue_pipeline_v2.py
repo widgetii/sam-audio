@@ -622,6 +622,10 @@ def process_movie(args):
             logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
             continue
 
+        # Offload SAM3 to CPU to free GPU memory for SAM-Audio separation
+        sam3_predictor.model.to("cpu")
+        torch.cuda.empty_cache()
+
         character_segments = []
 
         # Run SAM-Audio separation per character using SAM3's body masks
@@ -672,6 +676,9 @@ def process_movie(args):
 
         del chunk_frames, per_char_masks
         torch.cuda.empty_cache()
+
+        # Restore SAM3 to GPU for next chunk
+        sam3_predictor.model.to(device)
 
         chunk_meta["character_separation"] = character_segments
 
