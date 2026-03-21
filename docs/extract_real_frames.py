@@ -19,10 +19,10 @@ import numpy as np
 # Filmstrip: sample across movie to show variety of scenes and characters
 # Multi-face scenes for detection/mask panels
 TARGET_TIMESTAMPS_LONG = [
-    # Filmstrip: varied scenes across the movie showing different characters
-    300.0, 600.0, 900.0, 1200.0, 1480.0, 1800.0,
-    2400.0, 3000.0, 3600.0, 4200.0, 4800.0, 5400.0,
-    6000.0, 6600.0, 7200.0, 7800.0,
+    # Filmstrip: 16 frames within the timeline window (80:00-90:00)
+    # Every ~40s so filmstrip aligns with the speaking timeline below
+    4800.0, 4840.0, 4880.0, 4920.0, 4960.0, 5000.0, 5040.0, 5080.0,
+    5120.0, 5160.0, 5200.0, 5240.0, 5280.0, 5320.0, 5360.0, 5400.0,
     # Multi-face scenes for detection/mask panels
     1290.0, 1320.0, 1350.0, 1500.0,
 ]

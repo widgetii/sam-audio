@@ -8,3 +8,5 @@ dist
 .ipynb_checkpoints
 .venv
 docs/real_frames/
+export/onnx_models_web/
+workspace/

@@ -14,8 +14,9 @@ import whisper
 
 VIDEO_PATH = "/data/huggingface/Aliens.1986.mkv"
 # Filmstrip timestamps (same as in extract_real_frames.py)
-TIMESTAMPS = [300, 600, 900, 1200, 1480, 1800, 2400, 3000,
-              3600, 4200, 4800, 5400, 6000, 6600, 7200, 7800]
+# Filmstrip timestamps within the timeline window (80:00-90:00)
+TIMESTAMPS = [4800, 4840, 4880, 4920, 4960, 5000, 5040, 5080,
+              5120, 5160, 5200, 5240, 5280, 5320, 5360, 5400]
 
 # Audio track 0 = Russian (same as pipeline uses via torchaudio.load)
 AUDIO_TRACK = 0
@@ -50,6 +51,14 @@ for ts in TIMESTAMPS:
     result = model.transcribe(clip_path, language=None)
     text = result["text"].strip()
     lang = result.get("language", "unknown")
+
+    # Filter Whisper hallucinations (common on silent/ambient segments)
+    HALLUCINATIONS = ["thanks for watching", "subscribe", "thank you for watching",
+                      "like and subscribe", "see you next time"]
+    if any(h in text.lower() for h in HALLUCINATIONS):
+        print(f"  t={ts}s ({ts//60}:{ts%60:02d}): [{lang}] HALLUCINATION filtered: {text[:80]}")
+        text = ""
+
     print(f"  t={ts}s ({ts//60}:{ts%60:02d}): [{lang}] {text[:80]}")
     results[str(ts)] = {"text": text, "language": lang}
 
