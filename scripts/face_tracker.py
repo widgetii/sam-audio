@@ -238,6 +238,10 @@ class FaceTracker:
         # 1. Extract chunk frames as JPEGs to a temp directory
         #    SAM3 supports a directory of JPEG frames as input, avoiding
         #    loading the entire video (222K frames for a 2.5hr film).
+        # TODO: SAM3 processes every extracted frame (~2K for a 90s chunk at 24fps).
+        # SAM-Audio only needs ~150 frames at 480p for the visual prompt.
+        # Could subsample (e.g. every 5th frame) to reduce SAM3 load from
+        # ~2K to ~400 frames, then temporally resample SAM3 masks to match.
         chunk_frames_dir = tempfile.mkdtemp(prefix="sam3_chunk_")
         try:
             duration = chunk_end_sec - chunk_start_sec
@@ -250,6 +254,8 @@ class FaceTracker:
                 video_file,
                 "-t",
                 str(duration),
+                "-vf",
+                "scale=-2:480",  # downscale to 480p for VRAM efficiency
                 "-vsync",
                 "0",
                 "-q:v",
@@ -268,7 +274,10 @@ class FaceTracker:
             session_id = response["session_id"]
 
             # 3. Add body box prompts — frame_index is now chunk-local (0-based)
-            #    The keyframe timestamp maps to a local frame index within the chunk
+            #    Face bboxes are at full resolution, scale to 480p for SAM3
+            sam3_scale = 480 / frame_height if frame_height > 480 else 1.0
+            sam3_w = int(frame_width * sam3_scale)
+            sam3_h = 480 if frame_height > 480 else frame_height
             for char_id, det in character_detections.items():
                 # Convert detection timestamp to chunk-local frame index
                 det_time = getattr(det, "timestamp", -1.0)
@@ -279,13 +288,16 @@ class FaceTracker:
                     local_frame = int(duration * fps / 3)
                 local_frame = max(0, local_frame)
 
+                # Scale face bbox from full res to 480p
                 x1, y1, x2, y2 = det.bbox
-                face_w, face_h = x2 - x1, y2 - y1
+                x1s, y1s = int(x1 * sam3_scale), int(y1 * sam3_scale)
+                x2s, y2s = int(x2 * sam3_scale), int(y2 * sam3_scale)
+                face_w, face_h = x2s - x1s, y2s - y1s
                 body_box = [
-                    max(0, x1 - face_w),
-                    max(0, y1 - face_h // 2),
-                    min(frame_width, x2 + face_w),
-                    min(frame_height, y2 + face_h * 4),
+                    max(0, x1s - face_w),
+                    max(0, y1s - face_h // 2),
+                    min(sam3_w, x2s + face_w),
+                    min(sam3_h, y2s + face_h * 4),
                 ]
                 self.sam3.handle_request(
                     {
