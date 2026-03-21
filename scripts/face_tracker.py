@@ -85,11 +85,11 @@ class FaceTracker:
     def cluster_characters(
         self, all_detections: list[list[FaceDetection]]
     ) -> dict[int, CharacterInfo]:
-        """Two-phase clustering: tight clusters then merge small into large.
+        """Cluster face detections into characters.
 
-        Phase 1: Agglomerative clustering at threshold 0.5 (tight).
-        Phase 2: Merge clusters with <3 detections into nearest large cluster.
-        Renumber IDs to 0..K-1 sorted by screen time.
+        Single-pass agglomerative clustering at the configured threshold.
+        Small clusters (< 2 detections) are merged into the nearest larger
+        cluster only if the cosine similarity exceeds a minimum (0.15).
 
         Returns:
             character_id -> CharacterInfo, sequential IDs sorted by screen time (desc).
@@ -118,48 +118,44 @@ class FaceTracker:
                 )
             }
 
-        # Phase 1: Tight clustering
-        tight_threshold = min(self.cluster_threshold, 0.5)
         clustering = AgglomerativeClustering(
             n_clusters=None,
-            distance_threshold=tight_threshold,
+            distance_threshold=self.cluster_threshold,
             metric="cosine",
             linkage="average",
         )
         labels = clustering.fit_predict(embeddings)
 
-        # Phase 2: Merge small clusters into nearest large cluster
-        min_cluster_size = 3
+        # Merge singletons into nearest cluster if similarity is high enough
+        min_merge_similarity = 0.15
         unique_labels, counts = np.unique(labels, return_counts=True)
-        large_clusters = set(unique_labels[counts >= min_cluster_size])
-        small_clusters = set(unique_labels[counts < min_cluster_size])
+        large_clusters = set(unique_labels[counts >= 2])
+        singletons = set(unique_labels[counts < 2])
 
-        if large_clusters and small_clusters:
-            # Compute centroids of large clusters
+        if large_clusters and singletons:
             large_centroids = {}
             for lbl in large_clusters:
-                large_centroids[lbl] = embeddings[labels == lbl].mean(axis=0)
+                emb = embeddings[labels == lbl]
+                centroid = emb.mean(axis=0)
+                centroid /= max(np.linalg.norm(centroid), 1e-10)
+                large_centroids[lbl] = centroid
 
-            # Merge each small cluster into nearest large one
             large_ids = sorted(large_clusters)
             centroid_matrix = np.stack([large_centroids[lid] for lid in large_ids])
-
-            for small_lbl in small_clusters:
-                small_embs = embeddings[labels == small_lbl]
-                small_centroid = small_embs.mean(axis=0)
-                # Cosine similarity to all large centroids
-                norms_c = np.linalg.norm(centroid_matrix, axis=1, keepdims=True).clip(
-                    1e-10
-                )
-                norm_s = max(np.linalg.norm(small_centroid), 1e-10)
-                sims = (centroid_matrix @ small_centroid) / (norms_c.squeeze() * norm_s)
+            merged = 0
+            for s_lbl in singletons:
+                s_emb = embeddings[labels == s_lbl][0]
+                s_emb_n = s_emb / max(np.linalg.norm(s_emb), 1e-10)
+                sims = centroid_matrix @ s_emb_n
                 best_idx = int(np.argmax(sims))
-                best_large = large_ids[best_idx]
-                labels[labels == small_lbl] = best_large
+                if sims[best_idx] >= min_merge_similarity:
+                    labels[labels == s_lbl] = large_ids[best_idx]
+                    merged += 1
 
+            remaining = len(np.unique(labels))
             logger.info(
-                f"Cluster merge: {len(unique_labels)} → {len(large_clusters)} "
-                f"(merged {len(small_clusters)} small clusters)"
+                f"Clustering: {len(unique_labels)} initial → "
+                f"merged {merged} singletons → {remaining} characters"
             )
 
         # Renumber to 0..K-1 sorted by cluster size (descending)
