@@ -504,27 +504,33 @@ def process_movie(args):
             f"Phase A: scanning {len(dialogue_chunks)} dialogue chunks for faces"
         )
 
-        # Detect faces on 1 keyframe per dialogue chunk at 480p
+        # Detect faces at FULL resolution for high-quality embeddings.
+        # InsightFace needs faces ≥50px for reliable 512-dim ArcFace embeddings;
+        # at 480p many faces are <30px and produce garbage embeddings.
+        # After detection+embedding, scale bboxes down to 480p for SAM3/SAM-Audio.
         chunk_keyframe_dets: dict[int, list] = {}
         for chunk_meta in tqdm(dialogue_chunks, desc="Stage 3A: face detection"):
             idx = chunk_meta["chunk_index"]
-            # Pick keyframe at 1/3 into chunk (avoids shot transitions at edges)
             chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
             keyframe_t = chunk_meta["start_time"] + chunk_duration / 3
-            # Decode at 480p — same resolution SAM3 and SAM-Audio will use
-            keyframe = extract_chunk_frames(
+            # Decode at full resolution for face detection quality
+            keyframe_full = extract_chunk_frames(
                 video_decoder,
                 keyframe_t,
                 keyframe_t + 0.01,
                 fps,
                 max_frames=1,
-                max_height=480,
-            )  # [1, C, 480, W]
+                max_height=9999,  # no downscale
+            )  # [1, C, H, W]
+            _, _, full_h, full_w = keyframe_full.shape
 
-            dets = face_tracker.detect_faces(keyframe, frame_indices=[0])
-            # Quality filter at 480p
-            min_face_area = 500
+            dets = face_tracker.detect_faces(keyframe_full, frame_indices=[0])
+            del keyframe_full
+
+            # Quality filter at full resolution
+            min_face_area = 2500
             good_dets = []
+            scale = 480 / full_h if full_h > 480 else 1.0
             for det in dets[0]:
                 x1, y1, x2, y2 = det.bbox
                 w, h = x2 - x1, y2 - y1
@@ -532,12 +538,17 @@ def process_movie(args):
                 ar = w / h if h > 0 else 0.0
                 if area < min_face_area or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
                     continue
-                # Keep bbox at 480p — SAM3 and SAM-Audio both use 480p frames
+                # Scale bbox to 480p for SAM3/SAM-Audio
+                det.bbox = (
+                    int(x1 * scale),
+                    int(y1 * scale),
+                    int(x2 * scale),
+                    int(y2 * scale),
+                )
                 det.timestamp = keyframe_t
                 good_dets.append(det)
 
             chunk_keyframe_dets[idx] = good_dets
-            del keyframe
 
         total_face_dets = sum(len(d) for d in chunk_keyframe_dets.values())
         logger.info(
