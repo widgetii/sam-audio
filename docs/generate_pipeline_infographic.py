@@ -109,23 +109,24 @@ print(f"Available frames: {det_counts}")
 print(f"Best 3-face: {best_3face}, Best 2-face: {best_2face}")
 
 # ── Figure setup ───────────────────────────────────────────────────────
-fig = plt.figure(figsize=(30, 22), dpi=150)
+fig = plt.figure(figsize=(30, 28), dpi=150)
 fig.patch.set_facecolor(BG_DARK)
 
-fig.text(0.5, 0.98, "SAM-Audio Dialogue Pipeline", fontsize=32, fontweight="bold",
+fig.text(0.5, 0.98, "SAM-Audio Dialogue Pipeline v2", fontsize=32, fontweight="bold",
          ha="center", va="top", color=WHITE, fontfamily="sans-serif")
-fig.text(0.5, 0.963, "Per-Character Speech Isolation from Full-Length Movies",
+fig.text(0.5, 0.963, "Scene-Aware Multi-Modal Character Detection  |  Face + Voice Identity",
          fontsize=15, ha="center", va="top", color=ACCENT, fontfamily="sans-serif")
-fig.text(0.5, 0.95, "A100 80GB  |  Aliens (1986) 2h17m  |  8 Characters  |  3.3h Total",
+fig.text(0.5, 0.95, "A100 80GB  |  Aliens (1986) 1080p 2h17m  |  8 Characters  |  "
+         "1167 shots \u2192 128 scenes  |  6.4h Total",
          fontsize=12, ha="center", va="top", color=GRAY, fontfamily="monospace")
 
-# Load filmstrip frames — evenly-spaced across the full movie
+# Load filmstrip frames — aligned to the timeline window (78:00-88:00)
 import glob
 all_raw_frames = sorted(glob.glob(os.path.join(FRAMES_DIR, "frame_*_raw.png")),
                         key=lambda f: int(os.path.basename(f).split("_")[1]))
-# Use the 16 evenly-spaced frames (every ~8.5 min across 2h17m)
-filmstrip_timestamps = {300, 600, 900, 1200, 1480, 1800, 2400, 3000,
-                        3600, 4200, 4800, 5400, 6000, 6600, 7200, 7800}
+# 16 frames within the timeline window (80:00-90:00), every ~40s
+filmstrip_timestamps = {4800, 4840, 4880, 4920, 4960, 5000, 5040, 5080,
+                        5120, 5160, 5200, 5240, 5280, 5320, 5360, 5400}
 raw_frame_files = [f for f in all_raw_frames
                    if int(os.path.basename(f).split("_")[1]) in filmstrip_timestamps]
 
@@ -155,7 +156,7 @@ def draw_panel_bg(ax, title, subtitle=None, title_color=ACCENT):
 # Panel 1: Face Detection — REAL FRAMES
 # ═══════════════════════════════════════════════════════════════════════
 ax1 = fig.add_subplot(gs[0, 0])
-draw_panel_bg(ax1, "PASS 0: Face Detection", "InsightFace RetinaFace")
+draw_panel_bg(ax1, "STAGE 1: Dense Face Detection", "InsightFace GPU | 0.5s | det=0.3")
 
 # Use the 3-face frame (t=172s)
 det_key = best_3face[0] if best_3face else best_2face[0]
@@ -198,7 +199,7 @@ for i, face in enumerate(faces):
                        alpha=0.85, edgecolor="none"))
 
 # Stats
-stats_text = f"4,092 detections  |  every 2s  |  17 min (CPU)  |  t={det_ts:.0f}s"
+stats_text = f"18,006 frames  |  every 0.5s  |  80 min (GPU)  |  1080p  |  t={det_ts:.0f}s"
 ax1.text(0.50, 0.92, stats_text, fontsize=7.5, ha="center", color=GRAY,
          fontfamily="monospace",
          bbox=dict(boxstyle="round,pad=0.25", facecolor=BG_DARK, edgecolor=BORDER,
@@ -209,7 +210,7 @@ ax1.text(0.50, 0.92, stats_text, fontsize=7.5, ha="center", color=GRAY,
 # Panel 2: Clustering — REAL face crops with t-SNE from actual embeddings
 # ═══════════════════════════════════════════════════════════════════════
 ax2 = fig.add_subplot(gs[0, 1])
-draw_panel_bg(ax2, "PASS 0: ArcFace Clustering", "cosine d=0.6")
+draw_panel_bg(ax2, "STAGE 1: ArcFace Clustering", "cosine d=0.6")
 
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
@@ -307,7 +308,7 @@ ax2.text(0.5, 0.95, f"512-dim ArcFace | {len(real_faces)} detections | {n_real_c
 # Panel 3: Mask Generation — REAL FRAMES with actual mask demo
 # ═══════════════════════════════════════════════════════════════════════
 ax3 = fig.add_subplot(gs[0, 2])
-draw_panel_bg(ax3, "PASS 0: Mask Generation", "SAM3 / BBox+20%")
+draw_panel_bg(ax3, "STAGE 4: Mask Generation", "SAM3 / BBox+20%")
 
 # Use Aliens frames with face detections for mask demo
 mask_frames = [
@@ -422,12 +423,13 @@ ax3.text(0.50, 0.05, "target = 0 (black)  |  video * mask.eq(0)",
 # Panel 4: Optimization History
 # ═══════════════════════════════════════════════════════════════════════
 ax4 = fig.add_subplot(gs[0, 3])
-draw_panel_bg(ax4, "Optimization History", "6 rounds", title_color=GREEN)
+draw_panel_bg(ax4, "Pipeline Evolution", "v1 \u2192 v2", title_color=GREEN)
 
-rounds = ["R1 Baseline", "R2 Range API", "R3 Batch API",
-          "R4 90s windows", "R5 Visibility", "R6 Final"]
-times = [393, 600, 390, 305, 197, 203]
-colors_bar = [GRAY, RED, GRAY, ORANGE, GREEN, GREEN]
+rounds = ["v1 Baseline", "v1 Range API", "v1 Batch API",
+          "v1 90s windows", "v1 Visibility", "v1 Final",
+          "v2 Scene-Aware"]
+times = [393, 600, 390, 305, 197, 203, 386]
+colors_bar = [GRAY, RED, GRAY, ORANGE, GREEN, GREEN, PURPLE]
 
 y_positions = np.arange(len(rounds))
 bars = ax4.barh(y_positions, times, color=colors_bar, height=0.55, alpha=0.7,
@@ -448,24 +450,26 @@ for i, (t, c) in enumerate(zip(times, colors_bar)):
     label = f" {h_val}h{m_val:02d}m"
     if i == 1:
         label += "  REGRESSION"
+    if i == 6:
+        label += "  +VOICE"
     ax4.text(t + 10, i, label, va="center", fontsize=9, color=c, fontweight="bold",
              fontfamily="monospace")
 
-ax4.text(0.97, 0.03, "49% FASTER", fontsize=18, ha="right", va="bottom",
-         color=GREEN, fontweight="bold", fontfamily="sans-serif",
+ax4.text(0.97, 0.03, "MULTI-MODAL", fontsize=16, ha="right", va="bottom",
+         color=PURPLE, fontweight="bold", fontfamily="sans-serif",
          transform=ax4.transAxes,
-         bbox=dict(boxstyle="round,pad=0.35", facecolor=BG_DARK, edgecolor=GREEN,
+         bbox=dict(boxstyle="round,pad=0.35", facecolor=BG_DARK, edgecolor=PURPLE,
                    alpha=0.95, linewidth=2.5))
-ax4.text(0.97, 0.15, "6h33m -> 3h23m", fontsize=10, ha="right", va="bottom",
-         color=GRAY, fontfamily="monospace", transform=ax4.transAxes)
+ax4.text(0.97, 0.15, "face + voice + scene propagation", fontsize=9, ha="right",
+         va="bottom", color=GRAY, fontfamily="monospace", transform=ax4.transAxes)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Panel 5: Pass 1 — Dialogue Detection
 # ═══════════════════════════════════════════════════════════════════════
 ax5 = fig.add_subplot(gs[1, 0:2])
-draw_panel_bg(ax5, "PASS 1: Text-Only Dialogue Detection",
-              '97 chunks x 90s | prompt="speech"', title_color=ORANGE)
+draw_panel_bg(ax5, "STAGE 3: Scene-Aligned Dialogue Detection",
+              '201 chunks | scene boundaries | prompt="speech"', title_color=ORANGE)
 
 t = np.linspace(0, 90, 4000)
 signal = np.zeros_like(t)
@@ -510,8 +514,8 @@ ax5.text(0.02, 0.68, "SAM-Audio separated speech", fontsize=9, color=ACCENT,
          fontfamily="monospace", fontweight="bold")
 ax5.text(0.02, 0.02, "has_dialogue  (1s RMS > -40dB)", fontsize=9, color=GREEN,
          fontfamily="monospace", fontweight="bold")
-ax5.text(0.98, 0.68, "Chunk 34/97  |  t = 50:00 - 51:30", fontsize=9, color=GRAY,
-         fontfamily="monospace", ha="right")
+ax5.text(0.98, 0.68, "Chunk 34/201  |  scene-aligned  |  no overlap", fontsize=9,
+         color=GRAY, fontfamily="monospace", ha="right")
 
 for s in range(0, 91, 15):
     x = 0.02 + (s / 90) * 0.96
@@ -526,8 +530,8 @@ for s in range(0, 91, 5):
 # Panel 6: Pass 2 — Visual Separation
 # ═══════════════════════════════════════════════════════════════════════
 ax6 = fig.add_subplot(gs[1, 2:4])
-draw_panel_bg(ax6, "PASS 2: Visual Per-Character Separation",
-              "~130 eligible char-chunks | ~75s each", title_color=PURPLE)
+draw_panel_bg(ax6, "STAGE 4: Visual Separation + Voice Fingerprinting",
+              "93 multi-speaker chunks | Resemblyzer 256-dim", title_color=PURPLE)
 
 components = [
     ("DACVAE\nencode", 3, GRAY),
@@ -616,7 +620,7 @@ draw_panel_bg(ax7, "OUTPUT: Per-Character Speaking Timeline",
 # Score: many segments + many unique characters - penalty for simultaneous speakers
 movie_duration = timeline_data.get("movie_duration", 8220)
 window_duration = 600  # 10 minutes
-best_start = 4680  # default fallback (~78:00)
+best_start = 4800  # default fallback (~80:00)
 best_score = -1
 for test_start in range(0, movie_duration - window_duration, 60):
     test_end = test_start + window_duration
@@ -627,8 +631,10 @@ for test_start in range(0, movie_duration - window_duration, 60):
             if s < test_end and e > test_start:
                 seg_count += 1
                 char_set.add(cid)
-    # Count seconds with 3+ simultaneous speakers (looks unnatural)
+    # Penalize 3+ simultaneous speakers and long silent stretches (>30s)
     bad_seconds = 0
+    longest_silence = 0
+    cur_silence = 0
     for t in range(test_start, test_end, 2):  # sample every 2s for speed
         n_speaking = 0
         for cid, cdata in timeline_data["per_character"].items():
@@ -638,7 +644,14 @@ for test_start in range(0, movie_duration - window_duration, 60):
                     break
         if n_speaking >= 3:
             bad_seconds += 1
-    score = seg_count + len(char_set) * 5 - bad_seconds * 4
+        if n_speaking == 0:
+            cur_silence += 2
+        else:
+            longest_silence = max(longest_silence, cur_silence)
+            cur_silence = 0
+    longest_silence = max(longest_silence, cur_silence)
+    silence_penalty = max(0, longest_silence - 30) * 3
+    score = seg_count + len(char_set) * 5 - bad_seconds * 4 - silence_penalty
     if score > best_score:
         best_score = score
         best_start = test_start
@@ -719,13 +732,6 @@ if n_strip_frames > 0:
     x_start = 0.09 + (0.88 - total_strip_w) / 2  # center the strip
     x_start = max(0.09, x_start)
 
-    # Load subtitles for overlay
-    subs_path = os.path.join(FRAMES_DIR, "subtitles.json")
-    subtitles = {}
-    if os.path.exists(subs_path):
-        with open(subs_path) as f:
-            subtitles = json.load(f)
-
     for i, fpath in enumerate(raw_frame_files):
         frame_img = load_frame(os.path.basename(fpath))
         x = x_start + i * (frame_w_ax + gap)
@@ -736,44 +742,53 @@ if n_strip_frames > 0:
             (x, strip_y_bot), frame_w_ax, strip_h,
             linewidth=0.8, edgecolor="#555555", facecolor="none", zorder=4))
 
-        # Subtitle overlay at bottom of each frame
+    # Timestamp labels above each filmstrip frame (matching timeline axis)
+    for i, fpath in enumerate(raw_frame_files):
         ts = int(os.path.basename(fpath).split("_")[1])
-        sub_data = subtitles.get(str(ts), {})
-        sub_text = sub_data.get("text", "").strip()
-        if sub_text:
-            # Truncate to fit frame width (~12-15 chars per line)
-            max_chars = 18
-            lines = []
-            words = sub_text.split()
-            line = ""
-            for word in words:
-                if len(line) + len(word) + 1 <= max_chars:
-                    line = (line + " " + word).strip()
-                else:
-                    lines.append(line)
-                    line = word
-                if len(lines) >= 2:  # max 2 lines
-                    break
-            if line and len(lines) < 2:
-                lines.append(line)
-
-            sub_display = "\n".join(lines)
-            # Semi-transparent background bar + white text
-            ax7.text(x + frame_w_ax / 2, strip_y_bot + strip_h * 0.08,
-                     sub_display, fontsize=4.5, ha="center", va="bottom",
-                     color="white", fontfamily="sans-serif", fontweight="bold",
-                     linespacing=1.1, zorder=6,
-                     bbox=dict(boxstyle="square,pad=0.15", facecolor="black",
-                               alpha=0.7, edgecolor="none"))
+        m, s = divmod(ts, 60)
+        x = x_start + i * (frame_w_ax + gap) + frame_w_ax / 2
+        ax7.text(x, strip_y_top + 0.018, f"{m}:{s:02d}",
+                 fontsize=5, ha="center", va="bottom", color=GRAY,
+                 fontfamily="monospace", alpha=0.7)
 
     ax7.text(0.075, (strip_y_top + strip_y_bot) / 2, "Frames",
              fontsize=7, ha="right", va="center", color=GRAY,
              fontfamily="monospace", fontweight="bold")
 
+# ── Load per-segment transcripts ──────────────────────────────────────
+transcripts_path = os.path.join(FRAMES_DIR, "segment_transcripts.json")
+seg_transcripts = {}
+if os.path.exists(transcripts_path):
+    with open(transcripts_path) as f:
+        seg_transcripts = json.load(f)
+
+# Build lookup: (cid, seg_start, seg_end) -> text
+# Filter junk: credits text, and deduplicate identical text at same time
+JUNK_PHRASES = ["редактор субтитр", "корректор", "субтитры"]
+_seen_time_text = set()  # (start, text) to deduplicate across characters
+transcript_lookup = {}
+for cid, tdata in seg_transcripts.items():
+    for seg in tdata["segments"]:
+        text = seg["text"].strip()
+        if not text:
+            continue
+        # Filter credits/junk
+        if any(j in text.lower() for j in JUNK_PHRASES):
+            continue
+        # Deduplicate: if another character already has this exact text
+        # at the same time, skip (Whisper heard the same audio)
+        dedup_key = (round(seg["start"], -1), text[:20])
+        if dedup_key in _seen_time_text:
+            continue
+        _seen_time_text.add(dedup_key)
+        transcript_lookup[(cid, seg["start"], seg["end"])] = text
+
 # ── Character speaking lanes ───────────────────────────────────────────
 # Start character lanes below the filmstrip
-lane_height = 0.065
+lane_height = 0.095
 start_y = strip_y_bot - 0.05 if n_strip_frames > 0 else 0.88
+
+_labeled_segs = []  # collect (x0, w, y, color, text, dur) for callout labels
 
 for i, cid in enumerate(char_order):
     cdata = timeline_data["per_character"][cid]
@@ -801,16 +816,29 @@ for i, cid in enumerate(char_order):
         w = ((e - s) / window_duration) * 0.88
         w = max(w, 0.002)  # minimum visible width
         # Glow
-        glow = mpatches.FancyBboxPatch((x0 - 0.001, y - 0.028), w + 0.002, 0.056,
+        glow = mpatches.FancyBboxPatch((x0 - 0.001, y - 0.032), w + 0.002, 0.064,
                                         boxstyle="round,pad=0.003",
                                         facecolor=color, alpha=0.12, edgecolor="none")
         ax7.add_patch(glow)
         # Main bar
-        rect = mpatches.FancyBboxPatch((x0, y - 0.022), w, 0.044,
+        rect = mpatches.FancyBboxPatch((x0, y - 0.027), w, 0.054,
                                         boxstyle="round,pad=0.003",
                                         facecolor=color, alpha=0.75,
                                         edgecolor=color, linewidth=0.5)
         ax7.add_patch(rect)
+
+        # Collect segments with transcripts for callout labels
+        seg_dur = e - s
+        if seg_dur >= 5:
+            for (tcid, ts, te), txt in transcript_lookup.items():
+                if tcid != cid:
+                    continue
+                if ts <= s + 2 and te >= e - 2:
+                    _labeled_segs.append((x0, w, y, color, txt, seg_dur))
+                    break
+                if max(ts, s) < min(te, e):
+                    _labeled_segs.append((x0, w, y, color, txt, seg_dur))
+                    break
 
 # Real gaps from R6 data
 gap_count = 0
@@ -830,6 +858,49 @@ for gap_start, gap_end in timeline_data["gaps"]:
                  va="top", color=CYAN, fontfamily="monospace", alpha=0.5, linespacing=1.2)
     gap_count += 1
 
+# ── Transcript text positioned at segment locations per character ──────
+# Group labeled segments by character lane (y position)
+from collections import defaultdict
+_segs_by_lane = defaultdict(list)
+for x0, w, y, color, text, dur in _labeled_segs:
+    _segs_by_lane[(y, color)].append((x0, w, text, dur))
+
+for (y, color), segs in _segs_by_lane.items():
+    # Sort by x position (time order)
+    segs.sort(key=lambda t: t[0])
+    for x0, w, text, dur in segs:
+        # Wrap text into multiple lines that fit the bar width
+        # At fontsize 5.5, ~1 char = 0.004 axes units
+        chars_per_line = max(3, int(w / 0.004))
+        if chars_per_line < 3:
+            continue
+        max_lines = 3
+        words = text.split()
+        lines = []
+        line = ""
+        for word in words:
+            if len(line) + len(word) + 1 <= chars_per_line:
+                line = (line + " " + word).strip()
+            else:
+                lines.append(line)
+                line = word
+                if len(lines) >= max_lines:
+                    break
+        if line and len(lines) < max_lines:
+            lines.append(line)
+        if not lines:
+            continue
+        # Add ellipsis if text was truncated
+        total_shown = sum(len(l) for l in lines)
+        if total_shown < len(text):
+            lines[-1] = lines[-1][:chars_per_line - 1] + "\u2026"
+        display_text = "\n".join(lines)
+        # Place text just below the bar
+        ax7.text(x0 + 0.002, y - 0.032, display_text, fontsize=5.5,
+                 ha="left", va="top", color=color,
+                 fontfamily="sans-serif", zorder=8, alpha=0.9,
+                 linespacing=1.1)
+
 # Time axis
 for s_offset in range(0, window_duration + 1, 60):
     x = 0.09 + (s_offset / window_duration) * 0.88
@@ -846,9 +917,9 @@ for s_offset in range(0, window_duration + 1, 15):
 win_m1 = window_start // 60
 win_m2 = window_end // 60
 ax7.text(0.5, 0.01,
-         f"Real R6 pipeline output  |  Showing {win_m1}:00-{win_m2}:00 "
+         f"v1 pipeline output  |  Showing {win_m1}:00-{win_m2}:00 "
          f"({window_duration // 60} min window)  |  "
-         f"8 tracked characters  |  RMS threshold: -40 dB",
+         f"8 tracked characters  |  v2: +voice fingerprinting +scene propagation",
          fontsize=8, ha="center", color=GRAY, fontfamily="monospace")
 
 
@@ -860,23 +931,23 @@ arrow_kw = dict(arrowstyle="-|>", color=ACCENT, lw=2.5, mutation_scale=20)
 fig.patches.append(FancyArrowPatch(
     (0.25, 0.625), (0.25, 0.605),
     transform=fig.transFigure, **arrow_kw))
-fig.text(0.27, 0.612, "audio + face clusters", fontsize=9, color=ACCENT,
+fig.text(0.27, 0.612, "scene-aligned audio + propagated chars", fontsize=9, color=ACCENT,
          fontfamily="monospace", fontweight="bold")
 
 fig.patches.append(FancyArrowPatch(
     (0.72, 0.625), (0.72, 0.605),
     transform=fig.transFigure, **arrow_kw))
-fig.text(0.74, 0.612, "masks per character", fontsize=9, color=ACCENT,
+fig.text(0.74, 0.612, "masks + voice embeddings", fontsize=9, color=ACCENT,
          fontfamily="monospace", fontweight="bold")
 
 fig.patches.append(FancyArrowPatch(
     (0.50, 0.33), (0.50, 0.31),
     transform=fig.transFigure, **arrow_kw))
-fig.text(0.52, 0.317, "per-character speech segments + quality scores", fontsize=9,
-         color=ACCENT, fontfamily="monospace", fontweight="bold")
+fig.text(0.52, 0.317, "per-character speech + voice profiles + scene metadata",
+         fontsize=9, color=ACCENT, fontfamily="monospace", fontweight="bold")
 
 # VRAM badge
-fig.text(0.97, 0.015, "VRAM: 57/80 GB  |  sam-audio-base-tv  |  48kHz mono",
+fig.text(0.97, 0.015, "VRAM: 57/80 GB  |  sam-audio-base-tv  |  48kHz  |  1080p\u21920.5s\u2192480p",
          fontsize=9, ha="right", va="bottom", color=GRAY, fontfamily="monospace",
          bbox=dict(boxstyle="round,pad=0.3", facecolor=BG_CARD, edgecolor=BORDER,
                    alpha=0.9, linewidth=1))
