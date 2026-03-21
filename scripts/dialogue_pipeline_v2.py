@@ -11,6 +11,7 @@ Four-stage pipeline:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -297,13 +298,23 @@ def build_timeline(chunk_results: list[dict], min_gap_seconds: float) -> dict:
 # --- Main pipeline ---
 
 
+def _source_tag(input_path: str) -> str:
+    """Short hash from source filename to namespace workspace artifacts."""
+    name = Path(input_path).stem
+    h = hashlib.sha256(name.encode()).hexdigest()[:8]
+    return f"{name}.{h}"
+
+
 def process_movie(args):
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     workspace = Path(args.workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    progress_path = workspace / "pipeline.progress.json"
+
+    # Namespace all artifacts by source file to prevent cross-video overwrites
+    tag = _source_tag(args.input)
+    progress_path = workspace / f"pipeline.{tag}.progress.json"
     progress = (
         load_progress(progress_path)
         if args.resume
@@ -316,7 +327,7 @@ def process_movie(args):
     )
 
     t_start = time.time()
-    shots_scenes_path = workspace / "shots_scenes.json"
+    shots_scenes_path = workspace / f"shots_scenes.{tag}.json"
 
     # ================================================================
     # STAGE 0: Shot Boundary Detection
@@ -331,17 +342,17 @@ def process_movie(args):
     logger.info("=== Stage 0: Shot Boundary Detection ===")
     t_stage0_start = time.time()
 
-    shots_json = workspace / "shots_av1an.json"
+    shots_json = workspace / f"shots.{tag}.json"
     if args.shots_json and Path(args.shots_json).exists():
         from scene_detector import load_shots_from_json
 
         shots = load_shots_from_json(args.shots_json, args.input)
         logger.info(f"Loaded {len(shots)} shots from {args.shots_json}")
-    elif shots_json.exists() and args.resume:
+    elif shots_json.exists():
         from scene_detector import load_shots_from_json
 
         shots = load_shots_from_json(str(shots_json), args.input)
-        logger.info(f"Resumed {len(shots)} shots from {shots_json}")
+        logger.info(f"Loaded {len(shots)} cached shots from {shots_json}")
     else:
         shots = detect_shots(args.input, str(shots_json))
 
