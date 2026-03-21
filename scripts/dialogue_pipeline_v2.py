@@ -382,6 +382,10 @@ def process_movie(args):
     processor = SAMAudioProcessor.from_pretrained(args.checkpoint)
 
     # Extract audio
+    # TODO: This loads the entire movie audio into RAM (~1.7GB for a 2.5hr film).
+    # We only need ~90s chunks at a time (~17MB). Could instead extract to a temp
+    # WAV file once, then use torchaudio.load(offset=, num_frames=) for random
+    # access per chunk — WAV supports seeking, video containers don't.
     logger.info("Extracting audio from video")
     full_audio = extract_audio(
         args.input, sample_rate=48000, stream_index=args.audio_stream
@@ -591,19 +595,16 @@ def process_movie(args):
         if len(char_dets) < 2:
             continue
 
-        # Convert chunk times to video frame indices for SAM3
-        chunk_start_vidframe = int(chunk_meta["start_time"] * fps)
-        chunk_end_vidframe = int(chunk_meta["end_time"] * fps)
-
         # SAM3 tracks ALL characters through the chunk simultaneously
         try:
             per_char_masks = face_tracker.track_characters_in_chunk(
                 video_file=args.input,
-                chunk_start_frame=chunk_start_vidframe,
-                chunk_end_frame=chunk_end_vidframe,
+                chunk_start_sec=chunk_meta["start_time"],
+                chunk_end_sec=chunk_meta["end_time"],
                 character_detections=char_dets,
                 frame_height=frame_height,
                 frame_width=frame_width,
+                fps=fps,
             )
         except Exception as e:
             logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
