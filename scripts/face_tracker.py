@@ -1,4 +1,4 @@
-"""Face detection, embedding, clustering, and mask generation for character tracking."""
+"""Face detection, embedding, clustering, and SAM3 body tracking for character tracking."""
 
 import logging
 from dataclasses import dataclass, field
@@ -20,7 +20,7 @@ class CharacterInfo:
 
 
 class FaceTracker:
-    """Detect faces, compute embeddings, cluster into characters, generate masks."""
+    """Detect faces, compute embeddings, cluster into characters, track bodies via SAM3."""
 
     def __init__(
         self,
@@ -65,24 +65,74 @@ class FaceTracker:
             frame_dets = []
             for face in faces:
                 bbox = tuple(int(v) for v in face.bbox)
+                x1, y1, x2, y2 = bbox
+                w, h = x2 - x1, y2 - y1
+                area = w * h
+                ar = w / h if h > 0 else 0.0
                 frame_dets.append(
                     FaceDetection(
                         bbox=bbox,
                         embedding=face.normed_embedding,
                         confidence=float(face.det_score),
                         frame_index=frame_indices[i],
+                        bbox_area=area,
+                        aspect_ratio=round(ar, 3),
                     )
                 )
             all_detections.append(frame_dets)
         return all_detections
 
+    @staticmethod
+    def filter_detections(
+        all_detections: list[list[FaceDetection]],
+        min_area: int = 2500,
+        min_confidence: float = 0.5,
+        min_aspect_ratio: float = 0.4,
+        max_aspect_ratio: float = 2.5,
+    ) -> list[list[FaceDetection]]:
+        """Filter out garbage detections before clustering.
+
+        Removes partial faces, tiny reflections, and poster faces.
+        """
+        total_before = sum(len(fd) for fd in all_detections)
+        filtered = []
+        for frame_dets in all_detections:
+            good = []
+            for det in frame_dets:
+                x1, y1, x2, y2 = det.bbox
+                w, h = x2 - x1, y2 - y1
+                area = w * h if det.bbox_area == 0 else det.bbox_area
+                ar = (
+                    (w / h if h > 0 else 0.0)
+                    if det.aspect_ratio == 0.0
+                    else det.aspect_ratio
+                )
+                if area < min_area:
+                    continue
+                if det.confidence < min_confidence:
+                    continue
+                if ar < min_aspect_ratio or ar > max_aspect_ratio:
+                    continue
+                good.append(det)
+            filtered.append(good)
+        total_after = sum(len(fd) for fd in filtered)
+        logger.info(
+            f"Quality filter: {total_before} → {total_after} detections "
+            f"(removed {total_before - total_after})"
+        )
+        return filtered
+
     def cluster_characters(
         self, all_detections: list[list[FaceDetection]]
     ) -> dict[int, CharacterInfo]:
-        """Cluster face detections into characters using agglomerative clustering.
+        """Two-phase clustering: tight clusters then merge small into large.
+
+        Phase 1: Agglomerative clustering at threshold 0.5 (tight).
+        Phase 2: Merge clusters with <3 detections into nearest large cluster.
+        Renumber IDs to 0..K-1 sorted by screen time.
 
         Returns:
-            character_id -> CharacterInfo, sorted by total screen time (descending).
+            character_id -> CharacterInfo, sequential IDs sorted by screen time (desc).
         """
         # Collect all embeddings
         flat_dets = []
@@ -108,17 +158,61 @@ class FaceTracker:
                 )
             }
 
+        # Phase 1: Tight clustering
+        tight_threshold = min(self.cluster_threshold, 0.5)
         clustering = AgglomerativeClustering(
             n_clusters=None,
-            distance_threshold=self.cluster_threshold,
+            distance_threshold=tight_threshold,
             metric="cosine",
             linkage="average",
         )
         labels = clustering.fit_predict(embeddings)
 
-        # Assign character_ids to detections
-        for det, label in zip(flat_dets, labels, strict=True):
-            det.character_id = int(label)
+        # Phase 2: Merge small clusters into nearest large cluster
+        min_cluster_size = 3
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        large_clusters = set(unique_labels[counts >= min_cluster_size])
+        small_clusters = set(unique_labels[counts < min_cluster_size])
+
+        if large_clusters and small_clusters:
+            # Compute centroids of large clusters
+            large_centroids = {}
+            for lbl in large_clusters:
+                large_centroids[lbl] = embeddings[labels == lbl].mean(axis=0)
+
+            # Merge each small cluster into nearest large one
+            large_ids = sorted(large_clusters)
+            centroid_matrix = np.stack([large_centroids[lid] for lid in large_ids])
+
+            for small_lbl in small_clusters:
+                small_embs = embeddings[labels == small_lbl]
+                small_centroid = small_embs.mean(axis=0)
+                # Cosine similarity to all large centroids
+                norms_c = np.linalg.norm(centroid_matrix, axis=1, keepdims=True).clip(
+                    1e-10
+                )
+                norm_s = max(np.linalg.norm(small_centroid), 1e-10)
+                sims = (centroid_matrix @ small_centroid) / (norms_c.squeeze() * norm_s)
+                best_idx = int(np.argmax(sims))
+                best_large = large_ids[best_idx]
+                labels[labels == small_lbl] = best_large
+
+            logger.info(
+                f"Cluster merge: {len(unique_labels)} → {len(large_clusters)} "
+                f"(merged {len(small_clusters)} small clusters)"
+            )
+
+        # Renumber to 0..K-1 sorted by cluster size (descending)
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        size_order = np.argsort(-counts)
+        old_to_new = {}
+        for new_id, idx in enumerate(size_order):
+            old_to_new[unique_labels[idx]] = new_id
+
+        for i, det in enumerate(flat_dets):
+            det.character_id = old_to_new[labels[i]]
+
+        new_labels = np.array([old_to_new[lbl] for lbl in labels])
 
         # Build CharacterInfo per cluster
         characters: dict[int, CharacterInfo] = {}
@@ -136,129 +230,173 @@ class FaceTracker:
 
         # Compute representative embedding as mean of cluster
         for cid, info in characters.items():
-            cluster_embs = embeddings[labels == cid]
+            cluster_embs = embeddings[new_labels == cid]
             info.representative_embedding = cluster_embs.mean(axis=0)
 
-        # Sort by total screen time (descending)
-        sorted_chars = dict(
-            sorted(characters.items(), key=lambda x: x[1].total_frames, reverse=True)
+        # Already sorted by screen time via renumbering
+        sorted_chars = dict(sorted(characters.items(), key=lambda x: x[0]))
+        logger.info(
+            f"Clustering: {len(flat_dets)} detections → {len(sorted_chars)} characters "
+            f"(IDs 0..{len(sorted_chars) - 1})"
         )
         return sorted_chars
 
-    def generate_masks(
+    def get_best_detection_per_character(
         self,
-        frames: torch.Tensor,
         all_detections: list[list[FaceDetection]],
-        character_id: int,
-        video_file: str | None = None,
-    ) -> torch.Tensor:
-        """Generate binary masks for a specific character.
+        sample_shot_indices: list[int],
+        chunk_start_sec: float,
+        chunk_end_sec: float,
+        character_ids: list[int],
+        sample_timestamps: list[float],
+    ) -> dict[int, FaceDetection]:
+        """Find the highest-confidence face detection per character within a chunk.
 
-        With SAM3: uses face bbox center as point prompt for precise segmentation.
-        Without SAM3: creates rectangular masks from face bboxes (padded 20%).
+        For each character, the detection's frame_index becomes the SAM3 prompt frame.
+        If no detection in chunk range, uses nearest detection from adjacent frames.
 
         Args:
-            frames: Video frames [N, C, H, W].
-            all_detections: Detections per frame (aligned to frames).
-            character_id: Which character to generate masks for.
-            video_file: Path to video file (needed for SAM3).
+            all_detections: All detections per sampled frame.
+            sample_shot_indices: Shot index for each sampled frame.
+            chunk_start_sec: Chunk start time.
+            chunk_end_sec: Chunk end time.
+            character_ids: Characters to find.
+            sample_timestamps: Timestamp for each sampled frame.
 
         Returns:
-            Binary mask tensor [N, 1, H, W] where target=0, background=1.
+            char_id -> best FaceDetection (only for characters found).
         """
-        N, C, H, W = frames.shape
-        masks = torch.ones(N, 1, H, W, dtype=frames.dtype)
+        best: dict[int, FaceDetection] = {}
 
-        if self.sam3 is not None and video_file is not None:
-            masks = self._generate_sam3_masks(
-                frames, all_detections, character_id, video_file
-            )
-        else:
-            masks = self._generate_bbox_masks(frames, all_detections, character_id)
-
-        return masks
-
-    def _generate_bbox_masks(
-        self,
-        frames: torch.Tensor,
-        all_detections: list[list[FaceDetection]],
-        character_id: int,
-    ) -> torch.Tensor:
-        """Fallback: rectangular masks from face bboxes with 20% padding."""
-        N, C, H, W = frames.shape
-        # background=1 (non-zero), target region=0
-        masks = torch.ones(N, 1, H, W, dtype=frames.dtype)
-
-        for i, frame_dets in enumerate(all_detections):
+        # Find frames within chunk time range
+        for frame_i, frame_dets in enumerate(all_detections):
+            if frame_i >= len(sample_timestamps):
+                break
+            t = sample_timestamps[frame_i]
+            if t < chunk_start_sec or t >= chunk_end_sec:
+                continue
             for det in frame_dets:
-                if det.character_id != character_id:
+                if det.character_id not in character_ids:
                     continue
-                x1, y1, x2, y2 = det.bbox
-                # Pad by 20% of bbox size
-                bw, bh = x2 - x1, y2 - y1
-                pad_x, pad_y = int(bw * 0.2), int(bh * 0.2)
-                x1 = max(0, x1 - pad_x)
-                y1 = max(0, y1 - pad_y)
-                x2 = min(W, x2 + pad_x)
-                y2 = min(H, y2 + pad_y)
-                masks[i, 0, y1:y2, x1:x2] = 0
-        return masks
+                cid = det.character_id
+                if cid not in best or det.confidence > best[cid].confidence:
+                    best[cid] = det
 
-    def _generate_sam3_masks(
+        # For missing characters, search nearest frames outside chunk
+        missing = set(character_ids) - set(best.keys())
+        if missing:
+            chunk_mid = (chunk_start_sec + chunk_end_sec) / 2
+            for cid in missing:
+                nearest_det = None
+                nearest_dist = float("inf")
+                for frame_i, frame_dets in enumerate(all_detections):
+                    if frame_i >= len(sample_timestamps):
+                        break
+                    t = sample_timestamps[frame_i]
+                    for det in frame_dets:
+                        if det.character_id == cid:
+                            dist = abs(t - chunk_mid)
+                            if dist < nearest_dist:
+                                nearest_dist = dist
+                                nearest_det = det
+                if nearest_det is not None:
+                    best[cid] = nearest_det
+
+        return best
+
+    def track_characters_in_chunk(
         self,
-        frames: torch.Tensor,
-        all_detections: list[list[FaceDetection]],
-        character_id: int,
         video_file: str,
-    ) -> torch.Tensor:
-        """Use SAM3 video predictor with face bbox center as point prompt."""
-        N, C, H, W = frames.shape
+        chunk_start_frame: int,
+        chunk_end_frame: int,
+        character_detections: dict[int, FaceDetection],
+        frame_height: int,
+        frame_width: int,
+    ) -> dict[int, torch.Tensor]:
+        """Track multiple characters through a video chunk using SAM3.
 
+        Uses body box prompts (expanded from face bboxes) and SAM3's multi-object
+        video tracking with temporal state propagation.
+
+        Args:
+            video_file: Path to video file.
+            chunk_start_frame: Start frame index (in video frames).
+            chunk_end_frame: End frame index (in video frames).
+            character_detections: char_id -> best FaceDetection for prompting.
+            frame_height: Video frame height.
+            frame_width: Video frame width.
+
+        Returns:
+            char_id -> inverted mask tensor [N_frames, 1, H, W] (target=0, bg=1).
+        """
+        if self.sam3 is None:
+            raise RuntimeError("SAM3 predictor is required for body tracking")
+
+        # 1. Start SAM3 session
         response = self.sam3.handle_request(
-            request={"type": "start_session", "resource_path": video_file}
+            {
+                "type": "start_session",
+                "resource_path": video_file,
+            }
         )
         session_id = response["session_id"]
 
-        output_masks = []
-        prev_mask = np.zeros((1, H, W), dtype=bool)
+        # 2. Add body box prompts for each character on their best-detected frame
+        for char_id, det in character_detections.items():
+            x1, y1, x2, y2 = det.bbox
+            face_w, face_h = x2 - x1, y2 - y1
+            # Expand face bbox to approximate body bbox
+            body_box = [
+                max(0, x1 - face_w),  # left: 1 face-width padding
+                max(0, y1 - face_h // 2),  # top: half face-height above face
+                min(frame_width, x2 + face_w),  # right: 1 face-width padding
+                min(frame_height, y2 + face_h * 4),  # bottom: 4 face-heights below
+            ]
+            self.sam3.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": det.frame_index,
+                    "box": body_box,
+                    "obj_id": char_id,
+                }
+            )
 
-        for i, frame_dets in enumerate(all_detections):
-            # Find this character's bbox in this frame
-            char_det = None
-            for det in frame_dets:
-                if det.character_id == character_id:
-                    char_det = det
-                    break
+        # 3. Propagate through video — SAM3 tracks all bodies simultaneously
+        all_masks: dict[int, list] = {}  # char_id -> list of per-frame masks
+        frame_count = 0
+        for result in self.sam3.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "both",
+                "start_frame_index": chunk_start_frame,
+                "max_frame_num_to_track": chunk_end_frame - chunk_start_frame,
+            }
+        ):
+            frame_count += 1
+            for obj_id, mask in zip(
+                result["object_ids"], result["pred_masks"], strict=True
+            ):
+                all_masks.setdefault(obj_id, []).append(mask)
 
-            if char_det is not None:
-                x1, y1, x2, y2 = char_det.bbox
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                response = self.sam3.handle_request(
-                    request={
-                        "type": "add_prompt",
-                        "session_id": session_id,
-                        "frame_index": i,
-                        "points": [[cx, cy]],
-                        "labels": [1],
-                    }
-                )
-                mask = response["outputs"]["out_binary_masks"]
-                if mask.shape[0] == 0:
-                    mask = prev_mask
-                else:
-                    prev_mask = mask
-            else:
-                mask = prev_mask
+        logger.debug(
+            f"SAM3 tracked {len(character_detections)} bodies across {frame_count} frames"
+        )
 
-            output_masks.append(mask)
+        # 4. Convert to per-character mask tensors, invert (target=0, bg=1)
+        result_masks = {}
+        for char_id, masks in all_masks.items():
+            # Stack masks: each is [1, H, W] boolean
+            stacked = np.stack(masks)  # [N, 1, H, W]
+            mask_tensor = torch.from_numpy(stacked)
+            if mask_tensor.ndim == 3:
+                mask_tensor = mask_tensor.unsqueeze(1)
+            # Invert: SAM3 mask is True where object is, we need 0=target, 1=bg
+            inverted = (~mask_tensor.bool()).float()
+            result_masks[char_id] = inverted
 
-        # Convert: SAM3 mask is True where object is, we need 0=target, 1=background
-        mask_tensor = torch.from_numpy(np.stack(output_masks))  # [N, 1, H, W]
-        if mask_tensor.ndim == 3:
-            mask_tensor = mask_tensor.unsqueeze(1)
-        # Invert: target=0, background=1
-        inverted = (~mask_tensor.bool()).float()
-        return inverted
+        return result_masks
 
     def characters_in_range(
         self,

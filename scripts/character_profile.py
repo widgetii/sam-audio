@@ -16,6 +16,8 @@ class FaceDetection:
     timestamp: float = -1.0  # seconds into the movie
     character_id: int = -1  # assigned after clustering
     shot_index: int = -1  # which shot this detection belongs to
+    bbox_area: int = 0  # width * height in pixels
+    aspect_ratio: float = 0.0  # width / height
 
 
 @dataclass
