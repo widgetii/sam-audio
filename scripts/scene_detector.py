@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -82,9 +83,12 @@ def detect_shots_av1an(
         output_path = tmp.name
         tmp.close()
 
+    av1an = shutil.which("av1an")
+    if av1an is None:
+        raise RuntimeError("av1an not found on PATH")
     logger.info(f"Running av1an shot detection on {video_path}")
     cmd = [
-        "av1an",
+        av1an,
         "--sc-only",
         "-i",
         video_path,
@@ -100,128 +104,15 @@ def detect_shots_av1an(
     return load_shots_from_json(output_path, video_path)
 
 
-def detect_shots_ffmpeg(
-    video_path: str,
-    threshold: float = 0.3,
-    output_path: str | None = None,
-) -> list[Shot]:
-    """Detect shot boundaries using ffmpeg's scene detection filter.
-
-    Fallback when av1an is not available. Uses the select filter with
-    scene change detection.
-
-    Args:
-        video_path: Path to the video file.
-        threshold: Scene change threshold (0.0-1.0). Lower = more sensitive.
-        output_path: Optional path to save results JSON.
-
-    Returns:
-        List of Shot objects.
-    """
-    logger.info(
-        f"Running ffmpeg scene detection on {video_path} (threshold={threshold})"
-    )
-
-    # Get total duration and fps first
-    fps = _get_video_fps(video_path)
-    duration = _get_video_duration(video_path)
-
-    # Use ffmpeg to detect scene changes
-    cmd = [
-        "ffmpeg",
-        "-i",
-        video_path,
-        "-vf",
-        f"select='gt(scene,{threshold})',showinfo",
-        "-vsync",
-        "vfr",
-        "-f",
-        "null",
-        "-",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    # showinfo outputs to stderr
-    output = result.stderr
-
-    # Parse scene change timestamps from showinfo output
-    # Lines look like: [Parsed_showinfo_1 ...] n:   0 pts:  12345 pts_time:1.234
-    import re
-
-    timestamps = [0.0]  # first shot starts at 0
-    for line in output.split("\n"):
-        match = re.search(r"pts_time:\s*([\d.]+)", line)
-        if match:
-            timestamps.append(float(match.group(1)))
-
-    timestamps.append(duration)
-
-    # Build shots from consecutive timestamps
-    shots = []
-    for i in range(len(timestamps) - 1):
-        start = timestamps[i]
-        end = timestamps[i + 1]
-        if end - start < 0.04:  # skip degenerate shots < 1 frame
-            continue
-        shots.append(
-            Shot(
-                index=len(shots),
-                start_sec=start,
-                end_sec=end,
-                start_frame=int(start * fps),
-                end_frame=int(end * fps),
-            )
-        )
-
-    logger.info(f"Detected {len(shots)} shots via ffmpeg scene filter")
-
-    # Save to JSON for resume
-    if output_path:
-        data = {
-            "scenes": [[s.start_frame, s.end_frame] for s in shots],
-            "frames": int(duration * fps),
-            "method": "ffmpeg",
-            "threshold": threshold,
-        }
-        with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    return shots
-
-
-def _get_video_duration(video_path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe",
-        "-v",
-        "quiet",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        video_path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
-    except Exception:
-        logger.warning("Could not detect duration, defaulting to 0")
-        return 0.0
-
-
 def detect_shots(
     video_path: str,
     output_path: str | None = None,
-    ffmpeg_threshold: float = 0.3,
 ) -> list[Shot]:
-    """Detect shot boundaries, using av1an if available, ffmpeg otherwise."""
-    # Check if av1an is available
-    try:
-        subprocess.run(["av1an", "--version"], capture_output=True, check=True)
-        return detect_shots_av1an(video_path, output_path)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        logger.info("av1an not available, falling back to ffmpeg scene detection")
-        return detect_shots_ffmpeg(video_path, ffmpeg_threshold, output_path)
+    """Detect shot boundaries using av1an."""
+    av1an = shutil.which("av1an")
+    if av1an is None:
+        raise RuntimeError("av1an not found on PATH. Install av1an for shot detection.")
+    return detect_shots_av1an(video_path, output_path)
 
 
 def load_shots_from_json(json_path: str, video_path: str | None = None) -> list[Shot]:
