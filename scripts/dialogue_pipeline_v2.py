@@ -462,11 +462,6 @@ def process_movie(args):
     video_decoder = VideoDecoder(args.input, dimension_order="NCHW")
     fps = video_decoder.metadata.average_fps_from_header
 
-    # Get video dimensions (full resolution, for SAM3 body box clamping)
-    meta_frame = video_decoder.get_frames_played_at([0.0]).data
-    _, _, frame_height, frame_width = meta_frame.shape
-    del meta_frame
-
     # --- Phase A: face detection + clustering (InsightFace on GPU) ---
     face_tracker = FaceTracker(
         sam3_predictor=None,
@@ -477,9 +472,6 @@ def process_movie(args):
     dialogue_chunks = [c for c in chunk_results if c["has_any_dialogue"]]
     logger.info(f"Phase A: scanning {len(dialogue_chunks)} dialogue chunks for faces")
 
-    # Scale factor for converting 480p face bboxes back to full resolution
-    scale_factor = frame_height / 480 if frame_height > 480 else 1.0
-
     # Detect faces on 1 keyframe per dialogue chunk at 480p
     chunk_keyframe_dets: dict[int, list] = {}  # chunk_index -> list[FaceDetection]
     for chunk_meta in tqdm(dialogue_chunks, desc="Stage 3A: face detection"):
@@ -487,7 +479,7 @@ def process_movie(args):
         # Pick keyframe at 1/3 into chunk (avoids shot transitions at edges)
         chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
         keyframe_t = chunk_meta["start_time"] + chunk_duration / 3
-        # Decode at 480p — same resolution SAM-Audio will use
+        # Decode at 480p — same resolution SAM3 and SAM-Audio will use
         keyframe = extract_chunk_frames(
             video_decoder,
             keyframe_t,
@@ -498,26 +490,18 @@ def process_movie(args):
         )  # [1, C, 480, W]
 
         dets = face_tracker.detect_faces(keyframe, frame_indices=[0])
-        # Quality filter inline (thresholds scaled for 480p)
-        min_area_480p = int(2500 / (scale_factor**2))  # ~1000 at 480p for 1080p source
+        # Quality filter at 480p
+        min_face_area = 500
         good_dets = []
         for det in dets[0]:
             x1, y1, x2, y2 = det.bbox
             w, h = x2 - x1, y2 - y1
             area = w * h
             ar = w / h if h > 0 else 0.0
-            if area < min_area_480p or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
+            if area < min_face_area or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
                 continue
-            # Scale bbox back to full resolution for SAM3 body box prompts
-            det.bbox = (
-                int(x1 * scale_factor),
-                int(y1 * scale_factor),
-                int(x2 * scale_factor),
-                int(y2 * scale_factor),
-            )
+            # Keep bbox at 480p — SAM3 and SAM-Audio both use 480p frames
             det.timestamp = keyframe_t
-            det.bbox_area = int(area * scale_factor**2)
-            det.aspect_ratio = round(ar, 3)
             good_dets.append(det)
 
         chunk_keyframe_dets[idx] = good_dets
@@ -584,7 +568,7 @@ def process_movie(args):
 
         eligible_chars = chunk_meta["visible_characters"]
 
-        # Build character_detections from keyframe dets (already at full resolution)
+        # Build character_detections from keyframe dets (at 480p)
         char_dets = {}
         for det in chunk_keyframe_dets.get(idx, []):
             cid = det.character_id
@@ -595,22 +579,7 @@ def process_movie(args):
         if len(char_dets) < 2:
             continue
 
-        # SAM3 tracks ALL characters through the chunk simultaneously
-        try:
-            per_char_masks = face_tracker.track_characters_in_chunk(
-                video_file=args.input,
-                chunk_start_sec=chunk_meta["start_time"],
-                chunk_end_sec=chunk_meta["end_time"],
-                character_detections=char_dets,
-                frame_height=frame_height,
-                frame_width=frame_width,
-                fps=fps,
-            )
-        except Exception as e:
-            logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
-            continue
-
-        # Decode frames at 480p for SAM-Audio visual separation
+        # Single decode — shared by SAM3 and SAM-Audio (no temp files)
         chunk_frames = extract_chunk_frames(
             video_decoder,
             chunk_meta["start_time"],
@@ -619,25 +588,34 @@ def process_movie(args):
             max_frames=150,
         )
 
+        # Build prompt frame indices from keyframe timestamps
+        chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
+        prompt_indices = {}
+        for cid, det in char_dets.items():
+            det_time = getattr(det, "timestamp", -1.0)
+            if det_time >= 0:
+                t_frac = (det_time - chunk_meta["start_time"]) / chunk_duration
+                local_idx = int(t_frac * chunk_frames.shape[0])
+            else:
+                local_idx = chunk_frames.shape[0] // 3
+            prompt_indices[cid] = max(0, min(local_idx, chunk_frames.shape[0] - 1))
+
+        # SAM3 tracks ALL characters using shared frames (no re-decode)
+        try:
+            per_char_masks = face_tracker.track_characters_in_chunk(
+                chunk_frames=chunk_frames,
+                character_detections=char_dets,
+                prompt_frame_indices=prompt_indices,
+            )
+        except Exception as e:
+            logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
+            continue
+
         character_segments = []
 
         # Run SAM-Audio separation per character using SAM3's body masks
+        # Masks are already at 480p with same frame count — no resampling
         for char_id, masks in per_char_masks.items():
-            # Temporal resampling: pick nearest mask frame to match chunk_frames
-            n_frames = chunk_frames.shape[0]
-            if masks.shape[0] != n_frames:
-                mask_indices = (
-                    torch.linspace(0, masks.shape[0] - 1, n_frames).round().long()
-                )
-                masks = masks[mask_indices]
-
-            # Resize masks spatially to match chunk_frames resolution
-            _, _, fh, fw = chunk_frames.shape
-            if masks.shape[2] != fh or masks.shape[3] != fw:
-                masks = torch.nn.functional.interpolate(
-                    masks.float(), size=(fh, fw), mode="nearest"
-                )
-
             masked_video = processor.mask_videos([chunk_frames], [masks])
 
             batch = processor(

@@ -203,152 +203,165 @@ class FaceTracker:
 
     def track_characters_in_chunk(
         self,
-        video_file: str,
-        chunk_start_sec: float,
-        chunk_end_sec: float,
+        chunk_frames: torch.Tensor,
         character_detections: dict[int, FaceDetection],
-        frame_height: int,
-        frame_width: int,
-        fps: float,
+        prompt_frame_indices: dict[int, int],
     ) -> dict[int, torch.Tensor]:
-        """Track multiple characters through a video chunk using SAM3.
+        """Track multiple characters through pre-decoded video frames using SAM3.
 
-        Extracts chunk frames to a temp JPEG directory so SAM3 only loads
-        the chunk's frames (not the entire video).
+        Accepts pre-decoded tensor frames (shared with SAM-Audio) and passes
+        them as PIL images to SAM3 — no temp files, no re-decoding.
+
+        Uses text prompt "person" for auto-detection, then maps SAM3's
+        auto-assigned obj_ids to character IDs via face center overlap.
 
         Args:
-            video_file: Path to video file.
-            chunk_start_sec: Chunk start time in seconds.
-            chunk_end_sec: Chunk end time in seconds.
-            character_detections: char_id -> best FaceDetection for prompting.
-            frame_height: Video frame height.
-            frame_width: Video frame width.
-            fps: Video frame rate.
+            chunk_frames: Pre-decoded video frames [N, C, H, W] uint8 at 480p.
+            character_detections: char_id -> FaceDetection with bbox at
+                frame resolution (480p).
+            prompt_frame_indices: char_id -> chunk-local frame index for
+                prompting SAM3.
 
         Returns:
             char_id -> inverted mask tensor [N_frames, 1, H, W] (target=0, bg=1).
         """
-        import shutil
-        import subprocess
-        import tempfile
+        from PIL import Image
 
         if self.sam3 is None:
             raise RuntimeError("SAM3 predictor is required for body tracking")
 
-        # 1. Extract chunk frames as JPEGs to a temp directory
-        #    SAM3 supports a directory of JPEG frames as input, avoiding
-        #    loading the entire video (222K frames for a 2.5hr film).
-        # TODO: SAM3 processes every extracted frame (~2K for a 90s chunk at 24fps).
-        # SAM-Audio only needs ~150 frames at 480p for the visual prompt.
-        # Could subsample (e.g. every 5th frame) to reduce SAM3 load from
-        # ~2K to ~400 frames, then temporally resample SAM3 masks to match.
-        chunk_frames_dir = tempfile.mkdtemp(prefix="sam3_chunk_")
-        try:
-            duration = chunk_end_sec - chunk_start_sec
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                str(chunk_start_sec),
-                "-i",
-                video_file,
-                "-t",
-                str(duration),
-                "-vf",
-                "scale=-2:480",  # downscale to 480p for VRAM efficiency
-                "-vsync",
-                "0",
-                "-q:v",
-                "2",  # high quality JPEG
-                f"{chunk_frames_dir}/%06d.jpg",
-            ]
-            subprocess.run(cmd, capture_output=True, check=True)
+        n_frames, _, frame_h, frame_w = chunk_frames.shape
 
-            # 2. Start SAM3 session on the chunk frames directory
-            response = self.sam3.handle_request(
-                {
-                    "type": "start_session",
-                    "resource_path": chunk_frames_dir,
-                }
-            )
-            session_id = response["session_id"]
+        # Convert tensor frames to PIL images — SAM3's supported input format.
+        # SAM3 resizes to 1008x1008 internally and outputs masks at orig resolution.
+        pil_frames = []
+        for i in range(n_frames):
+            frame_np = chunk_frames[i].permute(1, 2, 0).cpu().numpy()
+            pil_frames.append(Image.fromarray(frame_np))
 
-            # 3. Add body box prompts — frame_index is now chunk-local (0-based)
-            #    Face bboxes are at full resolution, scale to 480p for SAM3
-            sam3_scale = 480 / frame_height if frame_height > 480 else 1.0
-            sam3_w = int(frame_width * sam3_scale)
-            sam3_h = 480 if frame_height > 480 else frame_height
-            for char_id, det in character_detections.items():
-                # Convert detection timestamp to chunk-local frame index
-                det_time = getattr(det, "timestamp", -1.0)
-                if det_time >= 0:
-                    local_frame = int((det_time - chunk_start_sec) * fps)
-                else:
-                    # Fallback: prompt at 1/3 into chunk
-                    local_frame = int(duration * fps / 3)
-                local_frame = max(0, local_frame)
+        # Start SAM3 session with PIL images (no disk I/O)
+        response = self.sam3.handle_request(
+            {
+                "type": "start_session",
+                "resource_path": pil_frames,
+            }
+        )
+        session_id = response["session_id"]
+        del pil_frames
 
-                # Scale face bbox from full res to 480p
-                x1, y1, x2, y2 = det.bbox
-                x1s, y1s = int(x1 * sam3_scale), int(y1 * sam3_scale)
-                x2s, y2s = int(x2 * sam3_scale), int(y2 * sam3_scale)
-                face_w, face_h = x2s - x1s, y2s - y1s
-                body_box = [
-                    max(0, x1s - face_w),
-                    max(0, y1s - face_h // 2),
-                    min(sam3_w, x2s + face_w),
-                    min(sam3_h, y2s + face_h * 4),
-                ]
-                self.sam3.handle_request(
-                    {
-                        "type": "add_prompt",
-                        "session_id": session_id,
-                        "frame_index": local_frame,
-                        "box": body_box,
-                        "obj_id": char_id,
-                    }
-                )
+        # Pick prompt frame — use the most common index among characters
+        prompt_frame = max(
+            set(prompt_frame_indices.values()),
+            key=list(prompt_frame_indices.values()).count,
+            default=0,
+        )
+        prompt_frame = max(0, min(prompt_frame, n_frames - 1))
 
-            # 4. Propagate through all chunk frames
-            all_masks: dict[int, list] = {}
-            frame_count = 0
-            for result in self.sam3.handle_stream_request(
-                {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "propagation_direction": "both",
-                    "start_frame_index": 0,
-                }
+        # Add text prompt "person" — SAM3 detects all people on prompt frame
+        response = self.sam3.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": prompt_frame,
+                "text": "person",
+            }
+        )
+
+        # Map SAM3 auto-assigned obj_ids to character IDs via face center overlap
+        outputs = response.get("outputs")
+        sam3_to_char: dict[int, int] = {}
+        if outputs is not None:
+            prompt_masks: dict[int, np.ndarray] = {}
+            for obj_id, mask in zip(
+                outputs["out_obj_ids"],
+                outputs["out_binary_masks"],
+                strict=True,
             ):
-                frame_count += 1
-                for obj_id, mask in zip(
-                    result["object_ids"], result["pred_masks"], strict=True
-                ):
-                    all_masks.setdefault(obj_id, []).append(mask)
+                prompt_masks[int(obj_id)] = mask  # [H, W] bool
 
-            # Close session to free GPU memory
+            used_sam3_ids: set[int] = set()
+            for char_id, det in character_detections.items():
+                x1, y1, x2, y2 = det.bbox
+                face_cx = min(int((x1 + x2) / 2), frame_w - 1)
+                face_cy = min(int((y1 + y2) / 2), frame_h - 1)
+
+                best_obj_id = None
+                best_area = float("inf")
+                for sam3_obj_id, mask in prompt_masks.items():
+                    if sam3_obj_id in used_sam3_ids:
+                        continue
+                    if mask[face_cy, face_cx]:
+                        area = int(mask.sum())
+                        if area < best_area:
+                            best_obj_id = sam3_obj_id
+                            best_area = area
+
+                if best_obj_id is not None:
+                    sam3_to_char[best_obj_id] = char_id
+                    used_sam3_ids.add(best_obj_id)
+
+        if not sam3_to_char:
             self.sam3.handle_request(
                 {"type": "close_session", "session_id": session_id}
             )
+            logger.warning("No SAM3 detections matched character face centers")
+            return {}
 
-            logger.debug(
-                f"SAM3 tracked {len(character_detections)} bodies "
-                f"across {frame_count} frames"
-            )
+        logger.debug(
+            f"SAM3 mapped {len(sam3_to_char)} objects to characters "
+            f"on prompt frame {prompt_frame}"
+        )
 
-            # 5. Convert to per-character mask tensors, invert (target=0, bg=1)
-            result_masks = {}
-            for char_id, masks in all_masks.items():
-                stacked = np.stack(masks)  # [N, 1, H, W]
-                mask_tensor = torch.from_numpy(stacked)
-                if mask_tensor.ndim == 3:
-                    mask_tensor = mask_tensor.unsqueeze(1)
-                inverted = (~mask_tensor.bool()).float()
-                result_masks[char_id] = inverted
+        # Propagate through all frames
+        per_frame_masks: dict[int, dict[int, np.ndarray]] = {}
+        frame_count = 0
+        for result in self.sam3.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "both",
+                "start_frame_index": 0,
+            }
+        ):
+            frame_count += 1
+            outputs = result.get("outputs")
+            if outputs is None:
+                continue
+            frame_idx = result["frame_index"]
+            for obj_id, mask in zip(
+                outputs["out_obj_ids"],
+                outputs["out_binary_masks"],
+                strict=True,
+            ):
+                obj_id = int(obj_id)
+                if obj_id in sam3_to_char:
+                    char_id = sam3_to_char[obj_id]
+                    per_frame_masks.setdefault(frame_idx, {})[char_id] = mask
 
-            return result_masks
-        finally:
-            shutil.rmtree(chunk_frames_dir, ignore_errors=True)
+        self.sam3.handle_request({"type": "close_session", "session_id": session_id})
+
+        logger.debug(
+            f"SAM3 tracked {len(sam3_to_char)} bodies across {frame_count} frames"
+        )
+
+        # Assemble per-character mask tensors, inverted (target=0, bg=1)
+        result_masks = {}
+        for char_id in sam3_to_char.values():
+            frame_masks = []
+            for fi in range(n_frames):
+                if fi in per_frame_masks and char_id in per_frame_masks[fi]:
+                    m = per_frame_masks[fi][char_id]
+                else:
+                    # No detection — use all-ones (no mask, full background)
+                    m = np.ones((frame_h, frame_w), dtype=bool)
+                frame_masks.append(m)
+
+            stacked = np.stack(frame_masks)  # [N, H, W]
+            mask_tensor = torch.from_numpy(stacked).unsqueeze(1)  # [N, 1, H, W]
+            inverted = (~mask_tensor.bool()).float()
+            result_masks[char_id] = inverted
+
+        return result_masks
 
     def cluster_to_profiles(
         self, all_detections: list[list[FaceDetection]]
