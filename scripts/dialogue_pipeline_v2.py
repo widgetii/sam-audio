@@ -671,23 +671,9 @@ def process_movie(args):
             logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
             continue
 
-        # Free SAM3 GPU memory before SAM-Audio separation.
-        # SAM3 uses ~30GB VRAM. Must aggressively delete all references.
-        import gc
-
-        sam3_predictor.shutdown()
-        sam3_predictor.model.detector.cpu()
-        sam3_predictor.model.tracker.cpu()
-        del sam3_predictor.model.detector
-        del sam3_predictor.model.tracker
-        del sam3_predictor.model
-        del sam3_predictor
-        del face_tracker.sam3
-        gc.collect()
+        # Offload SAM3 to CPU to free ~30GB VRAM for SAM-Audio separation
+        sam3_predictor.model.to("cpu")
         torch.cuda.empty_cache()
-        logger.info(
-            f"Freed SAM3 VRAM, {torch.cuda.memory_allocated() // 1024**2} MiB allocated"
-        )
 
         character_segments = []
 
@@ -740,9 +726,8 @@ def process_movie(args):
         del chunk_frames, per_char_masks
         torch.cuda.empty_cache()
 
-        # Reload SAM3 for next chunk (~10s from HF cache)
-        sam3_predictor = build_sam3_video_predictor()
-        face_tracker.sam3 = sam3_predictor
+        # Restore SAM3 to GPU for next chunk
+        sam3_predictor.model.to(device)
 
         chunk_meta["character_separation"] = character_segments
 
