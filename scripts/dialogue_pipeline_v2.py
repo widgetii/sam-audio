@@ -15,8 +15,13 @@ import hashlib
 import json
 import logging
 import math
+import os
+import pickle
 import time
 from pathlib import Path
+
+# Reduce CUDA memory fragmentation from SAM3↔SAM-Audio model swapping
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torchaudio
@@ -474,67 +479,98 @@ def process_movie(args):
     fps = video_decoder.metadata.average_fps_from_header
 
     # --- Phase A: face detection + clustering (InsightFace on GPU) ---
-    face_tracker = FaceTracker(
-        sam3_predictor=None,
-        det_threshold=args.face_det_threshold,
-        cluster_threshold=args.cluster_threshold,
-    )
+    stage3a_cache = workspace / f"stage3a.{tag}.pkl"
 
     dialogue_chunks = [c for c in chunk_results if c["has_any_dialogue"]]
-    logger.info(f"Phase A: scanning {len(dialogue_chunks)} dialogue chunks for faces")
 
-    # Detect faces on 1 keyframe per dialogue chunk at 480p
-    chunk_keyframe_dets: dict[int, list] = {}  # chunk_index -> list[FaceDetection]
-    for chunk_meta in tqdm(dialogue_chunks, desc="Stage 3A: face detection"):
-        idx = chunk_meta["chunk_index"]
-        # Pick keyframe at 1/3 into chunk (avoids shot transitions at edges)
-        chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
-        keyframe_t = chunk_meta["start_time"] + chunk_duration / 3
-        # Decode at 480p — same resolution SAM3 and SAM-Audio will use
-        keyframe = extract_chunk_frames(
-            video_decoder,
-            keyframe_t,
-            keyframe_t + 0.01,
-            fps,
-            max_frames=1,
-            max_height=480,
-        )  # [1, C, 480, W]
-
-        dets = face_tracker.detect_faces(keyframe, frame_indices=[0])
-        # Quality filter at 480p
-        min_face_area = 500
-        good_dets = []
-        for det in dets[0]:
-            x1, y1, x2, y2 = det.bbox
-            w, h = x2 - x1, y2 - y1
-            area = w * h
-            ar = w / h if h > 0 else 0.0
-            if area < min_face_area or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
-                continue
-            # Keep bbox at 480p — SAM3 and SAM-Audio both use 480p frames
-            det.timestamp = keyframe_t
-            good_dets.append(det)
-
-        chunk_keyframe_dets[idx] = good_dets
-        del keyframe
-
-    total_face_dets = sum(len(d) for d in chunk_keyframe_dets.values())
-    logger.info(
-        f"Phase A: {total_face_dets} face detections "
-        f"from {len(dialogue_chunks)} keyframes"
-    )
-
-    # Cluster all keyframe face detections → character profiles
-    all_keyframe_dets = [list(dets) for dets in chunk_keyframe_dets.values()]
-    all_keyframe_dets = [d for d in all_keyframe_dets if d]
-
-    if total_face_dets > 0:
-        profiles = face_tracker.cluster_to_profiles(all_keyframe_dets)
-        profiles = dict(list(profiles.items())[: args.max_characters])
-        logger.info(f"Clustered into {len(profiles)} characters")
+    if stage3a_cache.exists() and args.resume:
+        with open(stage3a_cache, "rb") as f:
+            cache = pickle.load(f)
+        chunk_keyframe_dets = cache["chunk_keyframe_dets"]
+        profiles = cache["profiles"]
+        total_face_dets = sum(len(d) for d in chunk_keyframe_dets.values())
+        logger.info(
+            f"Phase A: loaded {total_face_dets} cached face detections, "
+            f"{len(profiles)} characters from {stage3a_cache.name}"
+        )
     else:
-        profiles = {}
-        logger.warning("No face detections found, skipping visual separation")
+        face_tracker = FaceTracker(
+            sam3_predictor=None,
+            det_threshold=args.face_det_threshold,
+            cluster_threshold=args.cluster_threshold,
+        )
+
+        logger.info(
+            f"Phase A: scanning {len(dialogue_chunks)} dialogue chunks for faces"
+        )
+
+        # Detect faces on 1 keyframe per dialogue chunk at 480p
+        chunk_keyframe_dets: dict[int, list] = {}
+        for chunk_meta in tqdm(dialogue_chunks, desc="Stage 3A: face detection"):
+            idx = chunk_meta["chunk_index"]
+            # Pick keyframe at 1/3 into chunk (avoids shot transitions at edges)
+            chunk_duration = chunk_meta["end_time"] - chunk_meta["start_time"]
+            keyframe_t = chunk_meta["start_time"] + chunk_duration / 3
+            # Decode at 480p — same resolution SAM3 and SAM-Audio will use
+            keyframe = extract_chunk_frames(
+                video_decoder,
+                keyframe_t,
+                keyframe_t + 0.01,
+                fps,
+                max_frames=1,
+                max_height=480,
+            )  # [1, C, 480, W]
+
+            dets = face_tracker.detect_faces(keyframe, frame_indices=[0])
+            # Quality filter at 480p
+            min_face_area = 500
+            good_dets = []
+            for det in dets[0]:
+                x1, y1, x2, y2 = det.bbox
+                w, h = x2 - x1, y2 - y1
+                area = w * h
+                ar = w / h if h > 0 else 0.0
+                if area < min_face_area or det.confidence < 0.5 or ar < 0.4 or ar > 2.5:
+                    continue
+                # Keep bbox at 480p — SAM3 and SAM-Audio both use 480p frames
+                det.timestamp = keyframe_t
+                good_dets.append(det)
+
+            chunk_keyframe_dets[idx] = good_dets
+            del keyframe
+
+        total_face_dets = sum(len(d) for d in chunk_keyframe_dets.values())
+        logger.info(
+            f"Phase A: {total_face_dets} face detections "
+            f"from {len(dialogue_chunks)} keyframes"
+        )
+
+        # Cluster all keyframe face detections → character profiles
+        all_keyframe_dets = [list(dets) for dets in chunk_keyframe_dets.values()]
+        all_keyframe_dets = [d for d in all_keyframe_dets if d]
+
+        if total_face_dets > 0:
+            profiles = face_tracker.cluster_to_profiles(all_keyframe_dets)
+            profiles = dict(list(profiles.items())[: args.max_characters])
+            logger.info(f"Clustered into {len(profiles)} characters")
+        else:
+            profiles = {}
+            logger.warning("No face detections found, skipping visual separation")
+
+        # Cache Stage 3A results
+        with open(stage3a_cache, "wb") as f:
+            pickle.dump(
+                {
+                    "chunk_keyframe_dets": chunk_keyframe_dets,
+                    "profiles": profiles,
+                },
+                f,
+            )
+
+        # Unload InsightFace from GPU
+        del face_tracker.face_app
+        torch.cuda.empty_cache()
+        logger.info("Unloaded InsightFace, freeing GPU for SAM3")
 
     # Build char_id lookup per chunk from keyframe detections
     for idx, dets in chunk_keyframe_dets.items():
@@ -545,17 +581,19 @@ def process_movie(args):
                 cm["needs_visual_pass"] = len(char_ids) >= 2 and cm["has_any_dialogue"]
                 break
 
-    # Unload InsightFace from GPU before loading SAM3
-    del face_tracker.face_app
-    torch.cuda.empty_cache()
-    logger.info("Unloaded InsightFace, freeing GPU for SAM3")
-
     # --- Phase B: SAM3 body tracking + SAM-Audio separation ---
     from sam3.model_builder import build_sam3_video_predictor
     from voice_tracker import VoiceTracker
 
     sam3_predictor = build_sam3_video_predictor()
-    face_tracker.sam3 = sam3_predictor
+    # When resuming from Stage 3A cache, face_tracker was never created
+    # (FaceTracker.__init__ loads InsightFace which we want to skip).
+    # Create a lightweight stand-in that only has .sam3 for tracking.
+    try:
+        face_tracker.sam3 = sam3_predictor
+    except UnboundLocalError:
+        face_tracker = FaceTracker.__new__(FaceTracker)
+        face_tracker.sam3 = sam3_predictor
     logger.info("SAM3 video predictor loaded for body tracking")
 
     voice_tracker = VoiceTracker(device=device)
@@ -622,9 +660,23 @@ def process_movie(args):
             logger.warning(f"Chunk {idx}: SAM3 tracking failed: {e}")
             continue
 
-        # Offload SAM3 to CPU to free GPU memory for SAM-Audio separation
-        sam3_predictor.model.to("cpu")
+        # Free SAM3 GPU memory before SAM-Audio separation.
+        # SAM3 uses ~30GB VRAM. Must aggressively delete all references.
+        import gc
+
+        sam3_predictor.shutdown()
+        sam3_predictor.model.detector.cpu()
+        sam3_predictor.model.tracker.cpu()
+        del sam3_predictor.model.detector
+        del sam3_predictor.model.tracker
+        del sam3_predictor.model
+        del sam3_predictor
+        del face_tracker.sam3
+        gc.collect()
         torch.cuda.empty_cache()
+        logger.info(
+            f"Freed SAM3 VRAM, {torch.cuda.memory_allocated() // 1024**2} MiB allocated"
+        )
 
         character_segments = []
 
@@ -677,8 +729,9 @@ def process_movie(args):
         del chunk_frames, per_char_masks
         torch.cuda.empty_cache()
 
-        # Restore SAM3 to GPU for next chunk
-        sam3_predictor.model.to(device)
+        # Reload SAM3 for next chunk (~10s from HF cache)
+        sam3_predictor = build_sam3_video_predictor()
+        face_tracker.sam3 = sam3_predictor
 
         chunk_meta["character_separation"] = character_segments
 
