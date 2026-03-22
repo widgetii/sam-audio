@@ -707,16 +707,22 @@ def process_movie(args):
                 "segments": char_analysis["segments"],
             }
 
-            # Voice fingerprinting
-            voice_emb = voice_tracker.extract_from_separation(
-                target_cpu,
-                residual_cpu,
-                sample_rate=48000,
-                min_target_to_residual_db=args.voice_quality_threshold,
-            )
-            if voice_emb is not None and char_id in profiles:
-                voice_tracker.update_profile(profiles[char_id], voice_emb)
-                char_seg_entry["has_voice_sample"] = True
+            # Voice fingerprinting — extract from dialogue segments only
+            # (full-chunk RMS is dominated by non-speech, failing the threshold)
+            dial_segs = [s for s in char_analysis["segments"] if s["has_dialogue"]]
+            if dial_segs and char_id in profiles:
+                seg_start = int(
+                    (dial_segs[0]["start_time"] - chunk_meta["start_time"]) * 48000
+                )
+                seg_end = int(
+                    (dial_segs[-1]["end_time"] - chunk_meta["start_time"]) * 48000
+                )
+                voice_emb = voice_tracker.extract_embedding(
+                    target_cpu[..., seg_start:seg_end], sample_rate=48000
+                )
+                if voice_emb is not None:
+                    voice_tracker.update_profile(profiles[char_id], voice_emb)
+                    char_seg_entry["has_voice_sample"] = True
 
             character_segments.append(char_seg_entry)
 
