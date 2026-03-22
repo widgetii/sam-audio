@@ -741,6 +741,65 @@ def process_movie(args):
         progress["chunk_results"] = chunk_results
         save_progress(progress_path, progress)
 
+    # --- Phase C: Voice mapping for single-speaker dialogue chunks ---
+    # For chunks with dialogue but only 0-1 visible characters (no visual
+    # separation), extract a voice embedding from the Stage 2 separated audio
+    # and match against known character profiles.
+    if profiles and any(p.voice_embeddings for p in profiles.values()):
+        # Offload SAM3 to CPU — Phase C only needs SAM-Audio
+        sam3_predictor.model.to("cpu")
+        torch.cuda.empty_cache()
+
+        mono_chunks = [
+            c
+            for c in chunk_results
+            if c["has_any_dialogue"] and not c.get("needs_visual_pass")
+        ]
+        logger.info(f"Phase C: voice mapping {len(mono_chunks)} single-speaker chunks")
+
+        voice_mapped = 0
+        for chunk_meta in tqdm(mono_chunks, desc="Stage 3C: voice mapping"):
+            start_sample = int(chunk_meta["start_time"] * 48000)
+            end_sample = int(chunk_meta["end_time"] * 48000)
+            chunk_audio = full_audio[:, start_sample:end_sample]
+
+            # Run text-only separation to get clean speech
+            batch = processor(descriptions=["speech"], audios=[chunk_audio]).to(device)
+            result = model.separate(batch, max_chunk_tokens=args.max_chunk_tokens)
+
+            target_cpu = result.target[0].cpu()
+            residual_cpu = result.residual[0].cpu()
+            del batch, result
+            torch.cuda.empty_cache()
+
+            # Extract voice embedding from separated speech
+            voice_emb = voice_tracker.extract_from_separation(
+                target_cpu,
+                residual_cpu,
+                sample_rate=48000,
+                min_target_to_residual_db=args.voice_quality_threshold,
+            )
+            if voice_emb is None:
+                continue
+
+            match_id, sim = voice_tracker.match_to_profiles(voice_emb, profiles)
+            if match_id is not None:
+                chunk_meta["voice_match"] = {
+                    "character_id": match_id,
+                    "voice_similarity": round(sim, 3),
+                    "source": "voice_mapping",
+                }
+                voice_mapped += 1
+
+        logger.info(
+            f"Phase C: mapped {voice_mapped}/{len(mono_chunks)} chunks to characters"
+        )
+
+        # Restore SAM3 to GPU (in case it's needed later)
+        sam3_predictor.model.to(device)
+    else:
+        logger.info("Phase C: skipped — no voice profiles available")
+
     t_stage3 = time.time() - t_stage3_start
     logger.info(f"Stage 3 complete in {t_stage3:.1f}s")
 
@@ -752,20 +811,25 @@ def process_movie(args):
 
     timeline = build_timeline(chunk_results, args.min_gap_seconds)
 
-    # Compute per-character stats
+    # Compute per-character stats (visual separation + voice-matched monologues)
     char_stats = []
     for cid, profile in profiles.items():
         total_speaking = 0.0
         for chunk in chunk_results:
-            if "character_separation" not in chunk:
-                continue
-            for cs in chunk["character_separation"]:
-                if cs["character_id"] == cid:
-                    for seg in cs["segments"]:
-                        if seg["has_dialogue"]:
-                            total_speaking += seg["end_time"] - seg["start_time"]
+            # Visual separation (multi-speaker chunks)
+            if "character_separation" in chunk:
+                for cs in chunk["character_separation"]:
+                    if cs["character_id"] == cid:
+                        for seg in cs["segments"]:
+                            if seg["has_dialogue"]:
+                                total_speaking += seg["end_time"] - seg["start_time"]
+            # Voice-matched monologues (single-speaker chunks)
+            vm = chunk.get("voice_match")
+            if vm and vm["character_id"] == cid:
+                for seg in chunk["segments"]:
+                    if seg["has_dialogue"]:
+                        total_speaking += seg["end_time"] - seg["start_time"]
 
-        # Count keyframe detections for this character
         face_det_count = sum(
             1
             for dets in chunk_keyframe_dets.values()
@@ -789,13 +853,19 @@ def process_movie(args):
     for cid in profiles:
         segments = []
         for chunk in chunk_results:
-            if "character_separation" not in chunk:
-                continue
-            for cs in chunk["character_separation"]:
-                if cs["character_id"] == cid:
-                    for seg in cs["segments"]:
-                        if seg["has_dialogue"]:
-                            segments.append([seg["start_time"], seg["end_time"]])
+            # Visual separation
+            if "character_separation" in chunk:
+                for cs in chunk["character_separation"]:
+                    if cs["character_id"] == cid:
+                        for seg in cs["segments"]:
+                            if seg["has_dialogue"]:
+                                segments.append([seg["start_time"], seg["end_time"]])
+            # Voice-matched monologues
+            vm = chunk.get("voice_match")
+            if vm and vm["character_id"] == cid:
+                for seg in chunk["segments"]:
+                    if seg["has_dialogue"]:
+                        segments.append([seg["start_time"], seg["end_time"]])
         merged = _merge_segments(segments)
         per_character[str(cid)] = {"segments": merged}
 
