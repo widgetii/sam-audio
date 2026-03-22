@@ -107,7 +107,7 @@ def analyze_chunk(
         r_rms = rms_db(r_seg)
         t_to_r = t_rms - r_rms
 
-        has_dialogue = t_rms > rms_threshold_db
+        has_dialogue = t_rms > rms_threshold_db and t_to_r > 0
         if has_dialogue:
             has_any_dialogue = True
 
@@ -1012,8 +1012,8 @@ def main():
     parser.add_argument(
         "--rms-threshold-db",
         type=float,
-        default=-40,
-        help="RMS threshold for dialogue detection",
+        default=-50,
+        help="RMS threshold for dialogue detection (combined with target>residual ratio)",
     )
     parser.add_argument(
         "--min-gap-seconds",
