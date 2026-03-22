@@ -161,12 +161,18 @@ def transcribe_audio(
 # --- Attribution ---
 
 
-def attribute_words_to_characters(words: list[dict], per_character: dict) -> list[dict]:
-    """Assign each transcribed word to a character based on pipeline segments.
+def attribute_words(
+    words: list[dict],
+    per_character: dict,
+    dialogue_timeline: list[list[float]],
+) -> list[dict]:
+    """Assign each word a character_id (if in per-character segments) and
+    an in_dialogue flag (if in the full dialogue timeline).
 
     per_character: {char_id_str: {"segments": [[start, end], ...]}}
+    dialogue_timeline: [[start, end], ...]
     """
-    # Build flat list of (start, end, char_id)
+    # Build character intervals
     char_intervals = []
     for char_id_str, data in per_character.items():
         char_id = int(char_id_str)
@@ -174,55 +180,68 @@ def attribute_words_to_characters(words: list[dict], per_character: dict) -> lis
             char_intervals.append((seg[0], seg[1], char_id))
     char_intervals.sort()
 
+    # Sort dialogue timeline
+    dial_intervals = sorted(dialogue_timeline)
+
     for word in words:
         mid = (word["start"] + word["end"]) / 2
+        # Character attribution (multi-speaker chunks only)
         word["character_id"] = None
         for seg_start, seg_end, char_id in char_intervals:
             if seg_start <= mid <= seg_end:
                 word["character_id"] = char_id
                 break
+        # Full dialogue timeline (all detected dialogue)
+        word["in_dialogue"] = False
+        for seg_start, seg_end in dial_intervals:
+            if seg_start <= mid <= seg_end:
+                word["in_dialogue"] = True
+                break
+            if seg_start > mid:
+                break
 
     return words
 
 
-def build_character_lines(words: list[dict]) -> list[dict]:
-    """Group consecutive words by character into dialogue lines."""
+def build_dialogue_lines(words: list[dict]) -> list[dict]:
+    """Group consecutive words into dialogue lines.
+
+    Uses in_dialogue to include all detected dialogue, character_id for
+    attribution when available (multi-speaker chunks).
+    """
     lines = []
     current = None
 
     for word in words:
-        cid = word.get("character_id")
-        if cid is None:
+        if not word.get("in_dialogue") and word.get("character_id") is None:
             if current:
                 lines.append(current)
                 current = None
             continue
 
-        if (
-            current
-            and current["character_id"] == cid
-            and word["start"] - current["end"] < 1.0
-        ):
-            current["text"] += " " + word["text"]
-            current["end"] = word["end"]
-            current["words"].append(word)
-        else:
-            if current:
-                lines.append(current)
+        cid = word.get("character_id")  # may be None for single-speaker
+        gap = word["start"] - current["end"] if current else 999
+
+        # Break line on character change or gap > 1s
+        if current and (current["character_id"] != cid or gap > 1.0):
+            lines.append(current)
+            current = None
+
+        if current is None:
             current = {
                 "character_id": cid,
                 "start": word["start"],
                 "end": word["end"],
                 "text": word["text"],
-                "words": [word],
             }
+        else:
+            current["text"] += " " + word["text"]
+            current["end"] = word["end"]
 
     if current:
         lines.append(current)
 
-    # Clean up — drop word details from output
     for line in lines:
-        del line["words"]
         line["text"] = line["text"].strip()
 
     return lines
@@ -319,10 +338,12 @@ def main():
         pipeline = json.load(f)
 
     per_character = pipeline.get("per_character", {})
+    dialogue_timeline = pipeline.get("dialogue_timeline", [])
     characters = pipeline.get("characters", [])
     logger.info(
         f"Loaded pipeline results: {len(characters)} characters, "
-        f"{sum(len(v.get('segments', [])) for v in per_character.values())} speaking segments"
+        f"{sum(len(v.get('segments', [])) for v in per_character.values())} character segments, "
+        f"{len(dialogue_timeline)} dialogue segments"
     )
 
     # Extract subtitles
@@ -333,65 +354,90 @@ def main():
     # Transcribe
     words = transcribe_audio(args.input, args.audio_stream, args.whisper_model)
 
-    # Attribute words to characters
-    words = attribute_words_to_characters(words, per_character)
-    attributed = sum(1 for w in words if w["character_id"] is not None)
-    logger.info(f"Attributed {attributed}/{len(words)} words to characters")
+    # Attribute words to characters + full dialogue timeline
+    words = attribute_words(words, per_character, dialogue_timeline)
+    char_attributed = sum(1 for w in words if w["character_id"] is not None)
+    dial_attributed = sum(1 for w in words if w["in_dialogue"])
+    logger.info(
+        f"Words: {len(words)} total, {dial_attributed} in dialogue, "
+        f"{char_attributed} attributed to characters"
+    )
 
-    # Build character lines
-    character_lines = build_character_lines(words)
-    logger.info(f"Built {len(character_lines)} character dialogue lines")
+    # Build all dialogue lines (character when known, None for single-speaker)
+    all_lines = build_dialogue_lines(words)
+    char_lines = [ln for ln in all_lines if ln["character_id"] is not None]
+    unattr_lines = [ln for ln in all_lines if ln["character_id"] is None]
+    logger.info(
+        f"Dialogue lines: {len(all_lines)} total, "
+        f"{len(char_lines)} with character, {len(unattr_lines)} unattributed"
+    )
 
     # Per-character summary
     from collections import Counter
 
-    char_line_counts = Counter(ln["character_id"] for ln in character_lines)
+    char_line_counts = Counter(ln["character_id"] for ln in char_lines)
     for cid, count in char_line_counts.most_common():
         char_words = sum(
-            len(ln["text"].split())
-            for ln in character_lines
-            if ln["character_id"] == cid
+            len(ln["text"].split()) for ln in char_lines if ln["character_id"] == cid
         )
         logger.info(f"  Character {cid}: {count} lines, {char_words} words")
 
-    # Cross-validate against subtitles
-    logger.info("Cross-validating against subtitles...")
-    validation = cross_validate(character_lines, subtitles)
+    # Cross-validate: per-character lines only
+    logger.info("Cross-validating character lines against subtitles...")
+    char_validation = cross_validate(char_lines, subtitles)
     logger.info(
-        f"Subtitle recall: {validation['recall']}% "
-        f"({validation['matched']}/{validation['total_subtitles']})"
+        f"Character recall: {char_validation['recall']}% "
+        f"({char_validation['matched']}/{char_validation['total_subtitles']})"
+    )
+
+    # Cross-validate: ALL dialogue lines (character + unattributed)
+    logger.info("Cross-validating ALL dialogue lines against subtitles...")
+    full_validation = cross_validate(all_lines, subtitles)
+    logger.info(
+        f"Full dialogue recall: {full_validation['recall']}% "
+        f"({full_validation['matched']}/{full_validation['total_subtitles']})"
     )
 
     # Build output
     output = {
         "source": pipeline.get("source", {}),
         "characters": characters,
-        "character_lines": character_lines,
+        "dialogue_lines": all_lines,
         "subtitles": {"count": len(subtitles), "stream_index": args.subtitle_stream},
         "transcription": {
             "model": args.whisper_model,
             "total_words": len(words),
-            "attributed_words": attributed,
+            "in_dialogue": dial_attributed,
+            "with_character": char_attributed,
         },
-        "validation": validation,
+        "validation": {
+            "character_only": char_validation,
+            "full_dialogue": full_validation,
+        },
     }
 
     with open(args.output, "w") as f:
         json.dump(output, f, indent=2)
     logger.info(f"Wrote results to {args.output}")
 
-    # Print sample matches
-    print("\n=== Sample matches (subtitle → transcription) ===")
-    for m in validation["matches_sample"][:15]:
+    # Print results
+    print("\n=== Recall ===")
+    print(f"  Character lines vs subtitles: {char_validation['recall']}%")
+    print(f"  All dialogue vs subtitles:    {full_validation['recall']}%")
+
+    print("\n=== Sample matches (all dialogue) ===")
+    for m in full_validation["matches_sample"][:20]:
+        cid = m["character_id"]
+        label = f"char {cid}" if cid is not None else "unknown"
         print(
-            f"  [{m['sub_time']}] char {m['character_id']}: "
-            f'"{m["subtitle"]}" → "{m["transcribed"]}"'
+            f"  [{m['sub_time']}] {label}: "
+            f'"{m["subtitle"][:60]}" → "{m["transcribed"][:60]}"'
         )
 
-    if validation["unmatched_sample"]:
-        print(f"\n=== Unmatched subtitles ({validation['unmatched']}) ===")
-        for u in validation["unmatched_sample"][:10]:
-            print(f'  [{u["time"]}] {u.get("speaker", "?")}: "{u["text"]}"')
+    if full_validation["unmatched_sample"]:
+        print(f"\n=== Unmatched subtitles ({full_validation['unmatched']}) ===")
+        for u in full_validation["unmatched_sample"][:10]:
+            print(f'  [{u["time"]}] {u.get("speaker", "?")}: "{u["text"][:60]}"')
 
 
 if __name__ == "__main__":
