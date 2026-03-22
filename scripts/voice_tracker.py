@@ -94,7 +94,7 @@ class VoiceTracker:
         self,
         embedding: np.ndarray,
         profiles: dict[int, CharacterProfile],
-        threshold: float = 0.7,
+        threshold: float = 0.55,
     ) -> tuple[int | None, float]:
         """Match a voice embedding to known character profiles.
 

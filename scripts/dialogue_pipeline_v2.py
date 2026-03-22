@@ -757,13 +757,14 @@ def process_movie(args):
         ]
         logger.info(f"Phase C: voice mapping {len(mono_chunks)} single-speaker chunks")
 
-        voice_mapped = 0
-        for chunk_meta in tqdm(mono_chunks, desc="Stage 3C: voice mapping"):
+        # Extract voice embeddings from all mono chunks (reused across passes)
+        chunk_voice_embs: dict[int, object] = {}
+        for chunk_meta in tqdm(mono_chunks, desc="Stage 3C: voice extraction"):
+            idx = chunk_meta["chunk_index"]
             start_sample = int(chunk_meta["start_time"] * 48000)
             end_sample = int(chunk_meta["end_time"] * 48000)
             chunk_audio = full_audio[:, start_sample:end_sample]
 
-            # Run text-only separation to get clean speech
             batch = processor(descriptions=["speech"], audios=[chunk_audio]).to(device)
             result = model.separate(batch, max_chunk_tokens=args.max_chunk_tokens)
 
@@ -772,27 +773,52 @@ def process_movie(args):
             del batch, result
             torch.cuda.empty_cache()
 
-            # Extract voice embedding from separated speech
             voice_emb = voice_tracker.extract_from_separation(
                 target_cpu,
                 residual_cpu,
                 sample_rate=48000,
                 min_target_to_residual_db=args.voice_quality_threshold,
             )
-            if voice_emb is None:
-                continue
-
-            match_id, sim = voice_tracker.match_to_profiles(voice_emb, profiles)
-            if match_id is not None:
-                chunk_meta["voice_match"] = {
-                    "character_id": match_id,
-                    "voice_similarity": round(sim, 3),
-                    "source": "voice_mapping",
-                }
-                voice_mapped += 1
+            if voice_emb is not None:
+                chunk_voice_embs[idx] = voice_emb
 
         logger.info(
-            f"Phase C: mapped {voice_mapped}/{len(mono_chunks)} chunks to characters"
+            f"Phase C: extracted {len(chunk_voice_embs)}/{len(mono_chunks)} "
+            f"voice embeddings"
+        )
+
+        # Multi-pass matching: each pass matches and enriches profiles,
+        # enabling more matches in subsequent passes.
+        total_mapped = 0
+        for pass_num in range(3):
+            mapped_this_pass = 0
+            for chunk_meta in mono_chunks:
+                idx = chunk_meta["chunk_index"]
+                if chunk_meta.get("voice_match") or idx not in chunk_voice_embs:
+                    continue
+
+                voice_emb = chunk_voice_embs[idx]
+                match_id, sim = voice_tracker.match_to_profiles(voice_emb, profiles)
+                if match_id is not None:
+                    chunk_meta["voice_match"] = {
+                        "character_id": match_id,
+                        "voice_similarity": round(sim, 3),
+                        "source": "voice_mapping",
+                    }
+                    # Add voice sample back to enrich the profile
+                    voice_tracker.update_profile(profiles[match_id], voice_emb)
+                    mapped_this_pass += 1
+
+            total_mapped += mapped_this_pass
+            if mapped_this_pass == 0:
+                break
+            logger.info(
+                f"Phase C pass {pass_num + 1}: "
+                f"matched {mapped_this_pass} chunks (total {total_mapped})"
+            )
+
+        logger.info(
+            f"Phase C: mapped {total_mapped}/{len(mono_chunks)} chunks to characters"
         )
 
         # Restore SAM3 to GPU (in case it's needed later)
