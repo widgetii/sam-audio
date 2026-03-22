@@ -38,42 +38,108 @@ def extract_audio(
     sample_rate: int = 48000,
     stream_index: int | None = None,
 ) -> torch.Tensor:
-    """Extract mono audio from video file at target sample rate.
-
-    Args:
-        video_path: Path to the video file.
-        sample_rate: Target sample rate.
-        stream_index: Optional audio stream index for ffmpeg (e.g., 6 for 0:a:4).
-    """
+    """Extract mono downmix audio from video file at target sample rate."""
     if stream_index is not None:
-        # Use ffmpeg to extract specific audio stream
         import subprocess
         import tempfile
 
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
-        cmd = [
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-map",
+                f"0:{stream_index}",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                tmp.name,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        wav, sr = torchaudio.load(tmp.name)
+        Path(tmp.name).unlink()
+        return wav[:1]
+    else:
+        wav, sr = torchaudio.load(video_path)
+        if sr != sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, sample_rate)
+        return wav.mean(0, keepdim=True)
+
+
+def extract_center_channel(
+    video_path: str,
+    sample_rate: int = 48000,
+    stream_index: int | None = None,
+) -> torch.Tensor | None:
+    """Extract center channel from 5.1 surround audio.
+
+    Returns mono tensor of the center channel, or None if not 5.1.
+    The center channel carries dialogue in film mixes, with minimal
+    SFX/music contamination.
+    """
+    import subprocess
+    import tempfile
+
+    if stream_index is None:
+        return None
+
+    # Check if stream is 5.1
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-show_entries",
+            "stream=channels",
+            "-select_streams",
+            str(stream_index),
+            "-of",
+            "csv=p=0",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        channels = int(probe.stdout.strip())
+    except ValueError:
+        return None
+
+    if channels < 6:
+        logger.info(
+            f"Audio stream {stream_index} has {channels} channels, no center channel extraction"
+        )
+        return None
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    subprocess.run(
+        [
             "ffmpeg",
             "-y",
             "-i",
             video_path,
             "-map",
             f"0:{stream_index}",
-            "-ac",
-            "1",
+            "-af",
+            "pan=mono|c0=FC",
             "-ar",
             str(sample_rate),
             tmp.name,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        wav, sr = torchaudio.load(tmp.name)
-        Path(tmp.name).unlink()
-        return wav[:1]  # mono
-    else:
-        wav, sr = torchaudio.load(video_path)
-        if sr != sample_rate:
-            wav = torchaudio.functional.resample(wav, sr, sample_rate)
-        return wav.mean(0, keepdim=True)
+        ],
+        capture_output=True,
+        check=True,
+    )
+    wav, sr = torchaudio.load(tmp.name)
+    Path(tmp.name).unlink()
+    logger.info(f"Extracted center channel ({wav.shape[-1] / sr:.0f}s)")
+    return wav[:1]
 
 
 def rms_db(audio: torch.Tensor) -> float:
@@ -91,8 +157,15 @@ def analyze_chunk(
     chunk_index: int,
     sample_rate: int,
     rms_threshold_db: float,
+    center_audio: torch.Tensor | None = None,
+    center_threshold_db: float = -40.0,
 ) -> dict:
-    """Analyze a separated chunk into 1-second segments."""
+    """Analyze a separated chunk into 1-second segments.
+
+    Dialogue is detected by either:
+      1. SAM-Audio: target RMS > threshold AND target louder than residual
+      2. Center channel: center channel RMS > center_threshold (5.1 surround)
+    """
     seg_samples = sample_rate
     total_samples = target.shape[-1]
 
@@ -107,21 +180,31 @@ def analyze_chunk(
         r_rms = rms_db(r_seg)
         t_to_r = t_rms - r_rms
 
-        has_dialogue = t_rms > rms_threshold_db and t_to_r > 0
+        sam_dialogue = t_rms > rms_threshold_db and t_to_r > 0
+
+        # Center channel detection (5.1 surround — dialogue lives here)
+        center_rms_val = -100.0
+        if center_audio is not None:
+            c_seg = center_audio[..., seg_start:seg_end].flatten()
+            center_rms_val = rms_db(c_seg)
+        center_dialogue = center_rms_val > center_threshold_db
+
+        has_dialogue = sam_dialogue or center_dialogue
         if has_dialogue:
             has_any_dialogue = True
 
         seg_start_time = start_sec + seg_start / sample_rate
         seg_end_time = start_sec + seg_end / sample_rate
-        segments.append(
-            {
-                "start_time": round(seg_start_time, 3),
-                "end_time": round(seg_end_time, 3),
-                "has_dialogue": has_dialogue,
-                "target_rms_db": round(t_rms, 1),
-                "target_to_residual_db": round(t_to_r, 1),
-            }
-        )
+        seg_data = {
+            "start_time": round(seg_start_time, 3),
+            "end_time": round(seg_end_time, 3),
+            "has_dialogue": has_dialogue,
+            "target_rms_db": round(t_rms, 1),
+            "target_to_residual_db": round(t_to_r, 1),
+        }
+        if center_audio is not None:
+            seg_data["center_rms_db"] = round(center_rms_val, 1)
+        segments.append(seg_data)
 
     return {
         "chunk_index": chunk_index,
@@ -408,6 +491,11 @@ def process_movie(args):
     )
     total_duration = full_audio.shape[-1] / 48000
 
+    # Extract center channel from 5.1 surround for dialogue detection
+    center_audio = extract_center_channel(
+        args.input, sample_rate=48000, stream_index=args.audio_stream
+    )
+
     chunk_results = []
     completed_indices = set(progress["pass2_completed"])
     existing_results = {r["chunk_index"]: r for r in progress.get("chunk_results", [])}
@@ -428,6 +516,11 @@ def process_movie(args):
         batch = processor(descriptions=["speech"], audios=[chunk_audio]).to(device)
         result = model.separate(batch, max_chunk_tokens=args.max_chunk_tokens)
 
+        # Slice center channel for this chunk (if available)
+        center_chunk = None
+        if center_audio is not None:
+            center_chunk = center_audio[:, start_sample:end_sample]
+
         chunk_meta = analyze_chunk(
             result.target[0].cpu(),
             result.residual[0].cpu(),
@@ -436,6 +529,7 @@ def process_movie(args):
             idx,
             48000,
             args.rms_threshold_db,
+            center_audio=center_chunk,
         )
 
         chunk_meta["scene_id"] = chunk_info["scene_id"]
