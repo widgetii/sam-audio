@@ -239,46 +239,81 @@ def render_vertical_video(
     video_path: str,
     crops: list[dict],
     output_path: str,
+    start_sec: float = 0.0,
+    end_sec: float | None = None,
+    audio_stream: int = 0,
     target_fps: float = 24.0,
 ):
-    """Render vertical video using ffmpeg with crop positions.
+    """Render vertical video with per-frame dynamic cropping.
 
-    Uses a crop filter with sendcmd to change positions per frame.
-    For simplicity, uses the average crop position per second.
+    Decodes the source segment with ffmpeg, crops each frame in Python using
+    the precomputed crop positions, and pipes back to ffmpeg for encoding
+    with the original audio track.
     """
     if not crops:
         log.warning("No crop positions to render")
         return
 
-    # Group by second and average
-    by_sec: dict[int, list[dict]] = defaultdict(list)
-    for c in crops:
-        by_sec[int(c["timestamp"])].append(c)
-
     crop_w = crops[0]["crop_w"]
     crop_h = crops[0]["crop_h"]
 
-    # Build sendcmd script for crop position changes
-    lines = []
-    for sec in sorted(by_sec.keys()):
-        avg_x = int(np.mean([c["crop_x"] for c in by_sec[sec]]))
-        avg_y = int(np.mean([c["crop_y"] for c in by_sec[sec]]))
-        lines.append(f"{sec} [enter] crop x {avg_x};")
-        lines.append(f"{sec} [enter] crop y {avg_y};")
+    # Build sorted lookup: [(timestamp, crop_x, crop_y), ...]
+    crop_keys = np.array([c["timestamp"] for c in crops])
+    crop_xs = np.array([c["crop_x"] for c in crops])
+    crop_ys = np.array([c["crop_y"] for c in crops])
 
-    # TODO: use sendcmd for dynamic crop per second with the lines above
-    avg_x = int(np.mean([c["crop_x"] for c in crops]))
-    avg_y = int(np.mean([c["crop_y"] for c in crops]))
+    duration = (end_sec - start_sec) if end_sec else crops[-1]["timestamp"] - start_sec
 
-    cmd = [
+    # --- Decoder: ffmpeg → raw RGB frames to stdout ---
+    decode_cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "warning",
+        "-ss",
+        str(start_sec),
+        "-t",
+        str(duration),
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "-vsync",
+        "cfr",
+        "pipe:1",
+    ]
+
+    # --- Encoder: raw RGB from stdin → H.264 + audio ---
+    encode_cmd = [
         "ffmpeg",
         "-y",
         "-loglevel",
         "warning",
+        # Raw video input from pipe
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{crop_w}x{crop_h}",
+        "-r",
+        str(target_fps),
+        "-i",
+        "pipe:0",
+        # Audio from original file
+        "-ss",
+        str(start_sec),
+        "-t",
+        str(duration),
         "-i",
         video_path,
-        "-vf",
-        f"crop={crop_w}:{crop_h}:{avg_x}:{avg_y}",
+        "-map",
+        "0:v:0",
+        "-map",
+        f"1:a:{audio_stream}",
         "-c:v",
         "libx264",
         "-preset",
@@ -286,8 +321,74 @@ def render_vertical_video(
         "-crf",
         "18",
         "-c:a",
-        "copy",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
         output_path,
     ]
-    log.info(f"Rendering vertical video to {output_path}")
-    subprocess.run(cmd, check=True)
+
+    log.info(
+        f"Rendering {crop_w}x{crop_h} vertical video to {output_path} "
+        f"({duration:.1f}s, {len(crops)} crop keyframes)"
+    )
+
+    # Get source video dimensions from first crop's implied frame size
+    # We need source width/height to read raw frames — get via ffprobe
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    src_w, src_h = [int(x) for x in probe.stdout.strip().split(",")]
+    frame_bytes = src_w * src_h * 3  # RGB24
+
+    decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE)
+    encoder = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
+
+    frame_idx = 0
+    try:
+        while True:
+            raw = decoder.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(src_h, src_w, 3)
+
+            # Compute timestamp relative to start, find nearest crop position
+            t = frame_idx / target_fps
+            idx = int(np.searchsorted(crop_keys, t + start_sec, side="right")) - 1
+            idx = max(0, min(idx, len(crop_keys) - 1))
+
+            cx = int(crop_xs[idx])
+            cy = int(crop_ys[idx])
+
+            # Crop the frame
+            cropped = frame[cy : cy + crop_h, cx : cx + crop_w]
+            encoder.stdin.write(cropped.tobytes())
+
+            frame_idx += 1
+            if frame_idx % 1000 == 0:
+                log.info(f"  rendered {frame_idx} frames ({t:.1f}s)")
+    finally:
+        decoder.stdout.close()
+        encoder.stdin.close()
+        decoder.wait()
+        encoder.wait()
+
+    if encoder.returncode != 0:
+        raise RuntimeError(f"Encoder failed with return code {encoder.returncode}")
+
+    log.info(f"Done: {frame_idx} frames rendered to {output_path}")

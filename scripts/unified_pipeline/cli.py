@@ -88,7 +88,15 @@ def cmd_auto_frame(args):
     print(f"Computed {len(crops)} crop positions for {start:.1f}s - {end:.1f}s")
 
     if args.output:
-        render_vertical_video(args.video, crops, args.output, fps)
+        render_vertical_video(
+            args.video,
+            crops,
+            args.output,
+            start_sec=start,
+            end_sec=end,
+            audio_stream=args.audio_stream,
+            target_fps=fps,
+        )
         print(f"Rendered to {args.output}")
 
     db.close()
@@ -180,6 +188,9 @@ def main():
     p_af.add_argument("--start", type=float, help="Start time in seconds")
     p_af.add_argument("--end", type=float, help="End time in seconds")
     p_af.add_argument("-o", "--output", help="Output video path")
+    p_af.add_argument(
+        "--audio-stream", type=int, default=0, help="Audio stream index (default: 0)"
+    )
     p_af.set_defaults(func=cmd_auto_frame)
 
     # dialogue
