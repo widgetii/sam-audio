@@ -90,23 +90,47 @@ def interpolate_bbox(
     return tuple(b + (a - b) * t for b, a in zip(before, after, strict=True))
 
 
+def _is_fullframe_bbox(
+    bbox: tuple[float, float, float, float],
+    video_width: int,
+    video_height: int,
+    threshold: float = 0.85,
+) -> bool:
+    """Return True if bbox covers most of the frame (background detection)."""
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    return (w / video_width) > threshold and (h / video_height) > threshold
+
+
 def interpolate_tracks_to_fps(
     persons: list[PersonFrame],
     target_fps: float,
     start_sec: float,
     end_sec: float,
+    video_width: int = 1920,
+    video_height: int = 1080,
 ) -> dict[float, list[PersonFrame]]:
     """Interpolate 1fps person tracks to target_fps.
 
     Returns {timestamp: [PersonFrame, ...]} at every frame.
+    Only interpolates within each track's keyframe time range (no extrapolation
+    beyond the first/last keyframe). Filters out full-frame background detections.
     """
     # Group by (shot_id, obj_id)
     tracks: dict[tuple[int, int], list[PersonFrame]] = defaultdict(list)
     for p in persons:
+        # Skip full-frame background detections
+        if _is_fullframe_bbox(p.bbox, video_width, video_height):
+            continue
         tracks[(p.shot_id, p.sam3_obj_id)].append(p)
 
+    # Sort and compute time bounds per track
+    track_bounds: dict[tuple[int, int], tuple[float, float]] = {}
     for key in tracks:
         tracks[key].sort(key=lambda p: p.frame_sec)
+        kfs = tracks[key]
+        # Allow 0.5s padding beyond first/last keyframe (half the 1fps interval)
+        track_bounds[key] = (kfs[0].frame_sec - 0.5, kfs[-1].frame_sec + 0.5)
 
     result: dict[float, list[PersonFrame]] = defaultdict(list)
     dt = 1.0 / target_fps
@@ -115,7 +139,9 @@ def interpolate_tracks_to_fps(
     while t <= end_sec:
         t_round = round(t, 6)
         for (shot_id, obj_id), keyframes in tracks.items():
-            if not keyframes:
+            # Only interpolate within track's time range
+            lo, hi = track_bounds[(shot_id, obj_id)]
+            if t_round < lo or t_round > hi:
                 continue
 
             # Find surrounding keyframes
@@ -193,7 +219,9 @@ def compute_crop_positions(
     Returns list of {timestamp, crop_x, crop_y, crop_w, crop_h, character_id}.
     """
     persons = query_person_data(db, start_sec, end_sec)
-    interp = interpolate_tracks_to_fps(persons, target_fps, start_sec, end_sec)
+    interp = interpolate_tracks_to_fps(
+        persons, target_fps, start_sec, end_sec, video_width, video_height
+    )
 
     aspect = output_aspect[0] / output_aspect[1]
     crop_h = video_height
