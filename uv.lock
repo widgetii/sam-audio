@@ -2923,6 +2923,13 @@ export = [
     { name = "onnxruntime" },
     { name = "onnxscript" },
 ]
+unified = [
+    { name = "insightface" },
+    { name = "onnxruntime" },
+    { name = "resemblyzer" },
+    { name = "sam3" },
+    { name = "scikit-learn" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2956,6 +2963,13 @@ export = [
     { name = "onnx", specifier = ">=1.17" },
     { name = "onnxruntime" },
     { name = "onnxscript" },
+]
+unified = [
+    { name = "insightface" },
+    { name = "onnxruntime" },
+    { name = "resemblyzer", specifier = ">=0.1.3" },
+    { name = "sam3", git = "https://github.com/facebookresearch/sam3.git" },
+    { name = "scikit-learn" },
 ]
 
 [[package]]

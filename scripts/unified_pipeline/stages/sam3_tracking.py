@@ -1,0 +1,240 @@
+"""Stage 2: SAM3 person tracking at 1fps across all shots.
+
+SAM3 is a video segmentation model with temporal state — it provides
+consistent obj_ids across frames without needing ByteTrack.
+
+Each shot is a separate SAM3 session. Text prompt "person" detects all
+people on the first frame, then propagates through the shot at 1fps.
+"""
+
+import logging
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from unified_pipeline.db import AnalysisDB, mask_to_rle
+
+log = logging.getLogger(__name__)
+
+STAGE = "stage2"
+
+
+def _decode_frames_at_1fps(
+    video_path: str, start_sec: float, end_sec: float, output_dir: str
+) -> list[tuple[float, str]]:
+    """Decode frames at 1fps from a video segment, return (timestamp, path) pairs."""
+    duration = end_sec - start_sec
+    if duration < 0.1:
+        return []
+
+    pattern = os.path.join(output_dir, "frame_%06d.jpg")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        str(start_sec),
+        "-t",
+        str(duration),
+        "-i",
+        video_path,
+        "-vf",
+        "fps=1",
+        "-qscale:v",
+        "2",
+        pattern,
+    ]
+    subprocess.run(cmd, check=True)
+
+    frames = []
+    for i, path in enumerate(sorted(Path(output_dir).glob("frame_*.jpg"))):
+        t = start_sec + i  # 1fps => each frame is 1 second apart
+        frames.append((t, str(path)))
+
+    return frames
+
+
+def _bbox_from_mask(mask: np.ndarray) -> tuple[float, float, float, float]:
+    """Extract bounding box (x1, y1, x2, y2) from a binary mask."""
+    ys, xs = np.where(mask)
+    if len(ys) == 0:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+
+
+def run_stage2(
+    db: AnalysisDB,
+    video_path: str,
+    audio_stream: int = 0,
+    device: str = "cuda",
+    store_masks: bool = True,
+):
+    """Run SAM3 person tracking at 1fps for every shot.
+
+    Args:
+        db: Analysis database.
+        video_path: Path to source video.
+        audio_stream: Audio stream index (unused here, passed for consistency).
+        device: CUDA device.
+        store_masks: Whether to store RLE masks (large but needed for SAM-Audio visual sep).
+    """
+    shots = db.get_shots()
+    if not shots:
+        raise RuntimeError("Stage 2: no shots in DB — run stages 0-1 first")
+
+    progress = db.get_progress(STAGE)
+    remaining = [s for s in shots if progress.get(str(s["shot_id"])) != "done"]
+    if not remaining:
+        log.info("Stage 2: all shots already tracked, skipping")
+        return
+
+    log.info(f"Stage 2: tracking persons in {len(remaining)}/{len(shots)} shots")
+
+    # Load SAM3
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    from sam3.model_builder import build_sam3_video_predictor
+
+    sam3 = build_sam3_video_predictor()
+    sam3.model.to(device)
+
+    try:
+        _process_shots(db, sam3, video_path, remaining, store_masks)
+    finally:
+        sam3.model.to("cpu")
+        import torch
+
+        torch.cuda.empty_cache()
+
+
+def _process_shots(
+    db: AnalysisDB, sam3, video_path: str, shots: list[dict], store_masks: bool
+):
+    from PIL import Image
+
+    total_tracks = 0
+
+    for shot_idx, shot in enumerate(shots):
+        shot_id = shot["shot_id"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frames = _decode_frames_at_1fps(
+                video_path, shot["start_sec"], shot["end_sec"], tmpdir
+            )
+
+            if len(frames) == 0:
+                db.mark_progress(STAGE, str(shot_id), "done")
+                continue
+
+            # Load PIL images
+            pil_frames = [Image.open(path).convert("RGB") for _, path in frames]
+            timestamps = [t for t, _ in frames]
+
+            tracks = _track_persons_in_shot(
+                sam3, pil_frames, timestamps, shot_id, store_masks
+            )
+
+        if tracks:
+            db.insert_person_tracks(tracks)
+            total_tracks += len(tracks)
+
+        db.mark_progress(STAGE, str(shot_id), "done")
+
+        if (shot_idx + 1) % 50 == 0 or shot_idx == len(shots) - 1:
+            log.info(
+                f"Stage 2: {shot_idx + 1}/{len(shots)} shots done, "
+                f"{total_tracks} track rows total"
+            )
+
+
+def _track_persons_in_shot(
+    sam3, pil_frames: list, timestamps: list[float], shot_id: int, store_masks: bool
+) -> list[dict]:
+    """Run SAM3 text="person" on a shot's frames, return track rows."""
+    if len(pil_frames) == 0:
+        return []
+
+    # Start SAM3 session with frames
+    response = sam3.handle_request(
+        {
+            "type": "start_session",
+            "resource_path": pil_frames,
+        }
+    )
+    session_id = response["session_id"]
+
+    try:
+        # Text prompt "person" on first frame — detects all people
+        response = sam3.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": 0,
+                "text": "person",
+            }
+        )
+
+        # Collect initial detections
+        outputs = response.get("outputs")
+        if outputs is None or len(outputs.get("out_obj_ids", [])) == 0:
+            return []
+
+        # Propagate through all frames
+        per_frame: dict[int, dict[int, np.ndarray]] = {}
+
+        # Store frame 0 detections
+        for obj_id, mask in zip(
+            outputs["out_obj_ids"], outputs["out_binary_masks"], strict=True
+        ):
+            per_frame.setdefault(0, {})[int(obj_id)] = mask
+
+        # Propagate forward
+        for result in sam3.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": 0,
+            }
+        ):
+            frame_out = result.get("outputs")
+            if frame_out is None:
+                continue
+            fi = result["frame_index"]
+            for obj_id, mask in zip(
+                frame_out["out_obj_ids"], frame_out["out_binary_masks"], strict=True
+            ):
+                per_frame.setdefault(fi, {})[int(obj_id)] = mask
+
+        # Build track rows
+        track_rows = []
+        for fi in range(len(pil_frames)):
+            if fi not in per_frame:
+                continue
+            t = timestamps[fi]
+            for obj_id, mask in per_frame[fi].items():
+                bbox = _bbox_from_mask(mask)
+                if bbox[2] - bbox[0] < 1 and bbox[3] - bbox[1] < 1:
+                    continue  # skip empty masks
+
+                row = {
+                    "shot_id": shot_id,
+                    "sam3_obj_id": obj_id,
+                    "frame_sec": t,
+                    "bbox_x1": bbox[0],
+                    "bbox_y1": bbox[1],
+                    "bbox_x2": bbox[2],
+                    "bbox_y2": bbox[3],
+                    "mask_rle": mask_to_rle(mask.astype(np.uint8))
+                    if store_masks
+                    else None,
+                }
+                track_rows.append(row)
+
+        return track_rows
+
+    finally:
+        sam3.handle_request({"type": "close_session", "session_id": session_id})
