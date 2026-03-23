@@ -120,6 +120,10 @@ def run_stage2(
         torch.cuda.empty_cache()
 
 
+# Max frames per SAM3 session to avoid OOM (at 1080p: ~200 frames ≈ 1.2GB)
+MAX_FRAMES_PER_CHUNK = 200
+
+
 def _process_shots(
     db: AnalysisDB,
     sam3,
@@ -144,17 +148,29 @@ def _process_shots(
                 db.mark_progress(STAGE, str(shot_id), "done")
                 continue
 
-            # Load PIL images
-            pil_frames = [Image.open(path).convert("RGB") for _, path in frames]
-            timestamps = [t for t, _ in frames]
+            # Process in chunks to avoid OOM on long shots
+            shot_tracks = []
+            for chunk_start in range(0, len(frames), MAX_FRAMES_PER_CHUNK):
+                chunk_frames = frames[chunk_start : chunk_start + MAX_FRAMES_PER_CHUNK]
+                pil_frames = [
+                    Image.open(path).convert("RGB") for _, path in chunk_frames
+                ]
+                timestamps = [t for t, _ in chunk_frames]
 
-            tracks = _track_persons_in_shot(
-                sam3, pil_frames, timestamps, shot_id, store_masks
-            )
+                # Offset obj_ids for subsequent chunks to avoid collisions
+                obj_id_offset = chunk_start
 
-        if tracks:
-            db.insert_person_tracks(tracks)
-            total_tracks += len(tracks)
+                tracks = _track_persons_in_shot(
+                    sam3, pil_frames, timestamps, shot_id, store_masks, obj_id_offset
+                )
+                shot_tracks.extend(tracks)
+
+                # Free memory between chunks
+                del pil_frames
+
+        if shot_tracks:
+            db.insert_person_tracks(shot_tracks)
+            total_tracks += len(shot_tracks)
 
         db.mark_progress(STAGE, str(shot_id), "done")
 
@@ -166,7 +182,12 @@ def _process_shots(
 
 
 def _track_persons_in_shot(
-    sam3, pil_frames: list, timestamps: list[float], shot_id: int, store_masks: bool
+    sam3,
+    pil_frames: list,
+    timestamps: list[float],
+    shot_id: int,
+    store_masks: bool,
+    obj_id_offset: int = 0,
 ) -> list[dict]:
     """Run SAM3 text="person" on a shot's frames, return track rows."""
     if len(pil_frames) == 0:
@@ -237,7 +258,7 @@ def _track_persons_in_shot(
 
                 row = {
                     "shot_id": shot_id,
-                    "sam3_obj_id": obj_id,
+                    "sam3_obj_id": obj_id + obj_id_offset,
                     "frame_sec": t,
                     "bbox_x1": bbox[0],
                     "bbox_y1": bbox[1],
