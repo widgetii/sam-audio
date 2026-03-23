@@ -42,7 +42,7 @@ def run_pipeline(
     stages: str = "0,1,2,3,4,5",
     db_file: str | None = None,
     store_masks: bool = True,
-    cluster_threshold: float = 0.6,
+    cluster_threshold: float = 0.4,
     rms_threshold_db: float = -50.0,
     center_threshold_db: float = -40.0,
     talknet_model: str | None = None,

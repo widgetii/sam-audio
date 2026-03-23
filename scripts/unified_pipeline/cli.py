@@ -166,7 +166,7 @@ def main():
     p_extract.add_argument(
         "--no-masks", action="store_true", help="Skip storing RLE masks (saves space)"
     )
-    p_extract.add_argument("--cluster-threshold", type=float, default=0.6)
+    p_extract.add_argument("--cluster-threshold", type=float, default=0.4)
     p_extract.add_argument("--rms-threshold", type=float, default=-50.0)
     p_extract.add_argument("--center-threshold", type=float, default=-40.0)
     p_extract.add_argument("--talknet-model", help="TalkNet model checkpoint path")

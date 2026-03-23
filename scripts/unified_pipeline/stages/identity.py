@@ -39,13 +39,15 @@ def _extract_frame_jpeg(video_path: str, sec: float, output_path: str):
     )
 
 
-def run_stage3(db: AnalysisDB, video_path: str, cluster_threshold: float = 0.6):
+def run_stage3(db: AnalysisDB, video_path: str, cluster_threshold: float = 0.4):
     """Run InsightFace on SAM3 person crops, cluster into characters.
 
     Args:
         db: Analysis database.
         video_path: Source video path (for full-res frame extraction).
-        cluster_threshold: Agglomerative clustering distance threshold.
+        cluster_threshold: Agglomerative clustering cosine distance threshold.
+            Lower = more aggressive merging. 0.4 works well for cross-shot matching
+            (same person under different lighting/angles). 0.6 is too conservative.
     """
     shots = db.get_shots()
     if not shots:
@@ -172,7 +174,13 @@ def _detect_faces_in_shots(
 
 
 def _cluster_faces(db: AnalysisDB, threshold: float):
-    """Cluster face embeddings into characters, assign track identities."""
+    """Cluster face embeddings into characters, assign track identities.
+
+    Uses agglomerative clustering with singleton merging (from face_tracker.py):
+    1. Initial clustering at the given cosine distance threshold
+    2. Merge small clusters (<2 detections) into nearest large cluster if similarity >= 0.15
+    3. Sort by screen time (cluster size descending), renumber 0..K-1
+    """
     from sklearn.cluster import AgglomerativeClustering
 
     if db.count_rows("characters") > 0:
@@ -185,7 +193,7 @@ def _cluster_faces(db: AnalysisDB, threshold: float):
         log.warning("Stage 3: no face detections to cluster")
         return
 
-    # Filter to high-quality detections
+    # Filter to high-quality detections for clustering
     good_dets = [d for d in face_dets if d["face_score"] >= 0.5]
     if len(good_dets) < 2:
         good_dets = face_dets
@@ -214,29 +222,73 @@ def _cluster_faces(db: AnalysisDB, threshold: float):
         )
         labels = clustering.fit_predict(embeddings)
 
-    # Create characters from cluster centroids
-    cluster_ids = sorted(set(labels))
-    log.info(f"Stage 3: found {len(cluster_ids)} character clusters")
+    initial_count = len(set(labels))
+    log.info(f"Stage 3: initial clustering → {initial_count} clusters")
 
+    # Merge singletons into nearest large cluster (from face_tracker.py)
+    min_merge_similarity = 0.15
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    large_clusters = set(unique_labels[counts >= 2])
+    singletons = set(unique_labels[counts < 2])
+
+    if large_clusters and singletons:
+        large_centroids = {}
+        for lbl in large_clusters:
+            emb = embeddings[labels == lbl]
+            centroid = emb.mean(axis=0)
+            centroid /= max(np.linalg.norm(centroid), 1e-10)
+            large_centroids[lbl] = centroid
+
+        large_ids = sorted(large_clusters)
+        centroid_matrix = np.stack([large_centroids[lid] for lid in large_ids])
+        merged = 0
+        for s_lbl in singletons:
+            s_emb = embeddings[labels == s_lbl][0]
+            s_emb_n = s_emb / max(np.linalg.norm(s_emb), 1e-10)
+            sims = centroid_matrix @ s_emb_n
+            best_idx = int(np.argmax(sims))
+            if sims[best_idx] >= min_merge_similarity:
+                labels[labels == s_lbl] = large_ids[best_idx]
+                merged += 1
+
+        log.info(
+            f"Stage 3: merged {merged}/{len(singletons)} singletons → "
+            f"{len(np.unique(labels))} clusters"
+        )
+
+    # Renumber to 0..K-1 sorted by cluster size (descending = most screen time first)
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    size_order = np.argsort(-counts)
+    old_to_new = {}
+    for new_id, idx in enumerate(size_order):
+        old_to_new[unique_labels[idx]] = new_id
+
+    final_labels = np.array([old_to_new[lbl] for lbl in labels])
+    n_chars = len(unique_labels)
+    log.info(f"Stage 3: {n_chars} final characters (sorted by screen time)")
+
+    # Create characters from cluster centroids
     label_to_char: dict[int, int] = {}
-    for cid in cluster_ids:
-        mask = labels == cid
+    for new_id in range(n_chars):
+        mask = final_labels == new_id
         centroid = embeddings[mask].mean(axis=0)
         centroid = centroid / max(np.linalg.norm(centroid), 1e-8)
+        n_dets = int(mask.sum())
 
         char_id = db.insert_character(
-            name=f"Character {cid}",
+            name=f"Character {new_id}",
             face_embedding=centroid,
         )
-        label_to_char[cid] = char_id
+        label_to_char[new_id] = char_id
+        log.debug(f"  Character {new_id}: {n_dets} detections → DB id {char_id}")
 
     # Map each detection to character
     det_to_char: dict[tuple[int, int], int] = {}
-    for det, label in zip(good_dets, labels, strict=True):
+    for det, label in zip(good_dets, final_labels, strict=True):
         key = (det["shot_id"], det["sam3_obj_id"])
         det_to_char[key] = label_to_char[label]
 
-    # Also assign remaining detections by nearest centroid
+    # Also assign low-score detections (excluded from clustering) by nearest centroid
     characters = db.get_characters()
     char_embeddings = {
         c["character_id"]: c["face_embedding"]
