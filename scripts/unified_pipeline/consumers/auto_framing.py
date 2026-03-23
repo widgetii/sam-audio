@@ -35,6 +35,7 @@ class PersonFrame:
     asd_score: float = 0.0
     blur_score: float = 0.5
     has_face: bool = False
+    face_cx: float | None = None  # face bbox horizontal center, if detected
 
 
 def query_person_data(
@@ -56,11 +57,14 @@ def query_person_data(
         key = (b["shot_id"], b["sam3_obj_id"], round(b["frame_sec"], 3))
         blur_idx[key] = b["blur_score"]
 
-    # Face detection presence
+    # Face detection: presence + center x
     face_dets = db.get_face_detections()
     face_set: set[tuple[int, int]] = set()
+    face_cx_map: dict[tuple[int, int], float] = {}
     for f in face_dets:
-        face_set.add((f["shot_id"], f["sam3_obj_id"]))
+        key = (f["shot_id"], f["sam3_obj_id"])
+        face_set.add(key)
+        face_cx_map[key] = (f["face_bbox_x1"] + f["face_bbox_x2"]) / 2
 
     result = []
     for t in tracks:
@@ -76,6 +80,7 @@ def query_person_data(
                 asd_score=speaker_idx.get(key, 0.0),
                 blur_score=blur_idx.get(key, 0.5),
                 has_face=(t["shot_id"], t["sam3_obj_id"]) in face_set,
+                face_cx=face_cx_map.get((t["shot_id"], t["sam3_obj_id"])),
             )
         )
     return result
@@ -180,6 +185,7 @@ def interpolate_tracks_to_fps(
                     asd_score=before.asd_score,
                     blur_score=before.blur_score,
                     has_face=before.has_face,
+                    face_cx=before.face_cx,
                 )
             )
 
@@ -236,9 +242,12 @@ def compute_crop_positions(
     for t in sorted(interp.keys()):
         main = choose_main_person(interp[t])
         if main is not None:
-            # Center crop on main person's horizontal center
-            person_cx = (main.bbox[0] + main.bbox[2]) / 2
-            crop_x = int(person_cx - crop_w / 2)
+            # Center crop on face if detected, otherwise person bbox center
+            if main.face_cx is not None:
+                target_cx = main.face_cx
+            else:
+                target_cx = (main.bbox[0] + main.bbox[2]) / 2
+            crop_x = int(target_cx - crop_w / 2)
             crop_x = max(0, min(crop_x, video_width - crop_w))
         else:
             crop_x = prev_x
