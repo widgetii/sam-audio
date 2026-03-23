@@ -142,7 +142,7 @@ Where:
 
 1. For each frame at playback fps, find person tracks active at that timestamp (interpolate linearly between 1fps keyframes within each track's time span; skip tracks whose bbox covers >85% of frame width AND height — those are background).
 2. Pick highest-scoring person = main subject.
-3. Compute horizontal center: if the main person has a face detection in `face_detections`, use `face_center_x = (face_bbox_x1 + face_bbox_x2) / 2`; otherwise fall back to person bbox center `(bbox_x1 + bbox_x2) / 2`. Then `crop_x = center_x - crop_w / 2`, clamped to `[0, video_width - crop_w]`.
+3. Compute horizontal center from the **mask silhouette head position**: decode `mask_rle` from `person_tracks`, find the topmost rows with mask pixels, take the horizontal center of the top 10% of the mask height. This gives the head position (~30px accuracy vs face detection ground truth). Fall back to person bbox center `(bbox_x1 + bbox_x2) / 2` only if no mask is stored. Then `crop_x = center_x - crop_w / 2`, clamped to `[0, video_width - crop_w]`. Interpolate `head_cx` linearly between 1fps keyframes.
 4. Smooth: `crop_x = 0.7 * crop_x + 0.3 * prev_crop_x`.
 5. `crop_y = (video_height - crop_h) / 2` (centered vertically, always 0 for 1080p).
 6. `crop_w = 607, crop_h = 1080` (9:16 from 1920x1080).
