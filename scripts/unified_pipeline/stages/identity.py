@@ -269,6 +269,22 @@ def _cluster_faces(db: AnalysisDB, threshold: float):
         min_cluster_size = 3
         min_merge_similarity = 0.25
 
+    # Drop tiny clusters (< min_final_size detections) — background extras / noise
+    min_final_size = 2
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    keep_labels = set(unique_labels[counts >= min_final_size])
+    dropped = len(unique_labels) - len(keep_labels)
+    if dropped > 0:
+        log.info(
+            f"Stage 3: dropping {dropped} clusters with < {min_final_size} detections"
+        )
+
+    # Filter good_dets and labels to only kept clusters
+    keep_mask = np.array([lbl in keep_labels for lbl in labels])
+    good_dets = [d for d, k in zip(good_dets, keep_mask, strict=True) if k]
+    labels = labels[keep_mask]
+    embeddings = embeddings[keep_mask]
+
     # Renumber to 0..K-1 sorted by cluster size (descending = most screen time first)
     unique_labels, counts = np.unique(labels, return_counts=True)
     size_order = np.argsort(-counts)
