@@ -225,13 +225,20 @@ def _cluster_faces(db: AnalysisDB, threshold: float):
     initial_count = len(set(labels))
     log.info(f"Stage 3: initial clustering → {initial_count} clusters")
 
-    # Merge singletons into nearest large cluster (from face_tracker.py)
-    min_merge_similarity = 0.15
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    large_clusters = set(unique_labels[counts >= 2])
-    singletons = set(unique_labels[counts < 2])
+    # Merge small clusters into nearest large cluster.
+    # Two passes: first merge tiny clusters (< min_cluster_size) into large ones
+    # if cosine similarity >= min_merge_similarity.
+    min_cluster_size = 5  # clusters below this are candidates for merging
+    min_merge_similarity = 0.3  # must be at least this similar to merge
 
-    if large_clusters and singletons:
+    for pass_num in range(2):
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        large_clusters = set(unique_labels[counts >= min_cluster_size])
+        small_clusters = set(unique_labels[counts < min_cluster_size])
+
+        if not large_clusters or not small_clusters:
+            break
+
         large_centroids = {}
         for lbl in large_clusters:
             emb = embeddings[labels == lbl]
@@ -242,19 +249,25 @@ def _cluster_faces(db: AnalysisDB, threshold: float):
         large_ids = sorted(large_clusters)
         centroid_matrix = np.stack([large_centroids[lid] for lid in large_ids])
         merged = 0
-        for s_lbl in singletons:
-            s_emb = embeddings[labels == s_lbl][0]
-            s_emb_n = s_emb / max(np.linalg.norm(s_emb), 1e-10)
-            sims = centroid_matrix @ s_emb_n
+        for s_lbl in small_clusters:
+            s_embs = embeddings[labels == s_lbl]
+            s_centroid = s_embs.mean(axis=0)
+            s_centroid /= max(np.linalg.norm(s_centroid), 1e-10)
+            sims = centroid_matrix @ s_centroid
             best_idx = int(np.argmax(sims))
             if sims[best_idx] >= min_merge_similarity:
                 labels[labels == s_lbl] = large_ids[best_idx]
                 merged += 1
 
+        remaining = len(np.unique(labels))
         log.info(
-            f"Stage 3: merged {merged}/{len(singletons)} singletons → "
-            f"{len(np.unique(labels))} clusters"
+            f"Stage 3: merge pass {pass_num + 1}: "
+            f"merged {merged}/{len(small_clusters)} small clusters "
+            f"(size < {min_cluster_size}) → {remaining} clusters"
         )
+        # Second pass uses a lower bar since large clusters grew
+        min_cluster_size = 3
+        min_merge_similarity = 0.25
 
     # Renumber to 0..K-1 sorted by cluster size (descending = most screen time first)
     unique_labels, counts = np.unique(labels, return_counts=True)
