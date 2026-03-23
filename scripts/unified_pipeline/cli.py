@@ -44,6 +44,7 @@ def cmd_extract(args):
         rms_threshold_db=args.rms_threshold,
         center_threshold_db=args.center_threshold,
         talknet_model=args.talknet_model,
+        talknet_root=args.talknet_root,
         ddffnet_model=args.ddffnet_model,
     )
 
@@ -178,6 +179,9 @@ def main():
     p_extract.add_argument("--rms-threshold", type=float, default=-50.0)
     p_extract.add_argument("--center-threshold", type=float, default=-40.0)
     p_extract.add_argument("--talknet-model", help="TalkNet model checkpoint path")
+    p_extract.add_argument(
+        "--talknet-root", help="TalkNet source directory (contains talkNet.py)"
+    )
     p_extract.add_argument("--ddffnet-model", help="DDFFNet model checkpoint path")
     p_extract.set_defaults(func=cmd_extract)
 

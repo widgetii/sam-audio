@@ -46,6 +46,7 @@ def run_pipeline(
     rms_threshold_db: float = -50.0,
     center_threshold_db: float = -40.0,
     talknet_model: str | None = None,
+    talknet_root: str | None = None,
     ddffnet_model: str | None = None,
 ):
     """Run the unified video analysis pipeline.
@@ -61,6 +62,7 @@ def run_pipeline(
         rms_threshold_db: SAM-Audio dialogue threshold.
         center_threshold_db: Center channel dialogue threshold.
         talknet_model: Path to TalkNet model checkpoint.
+        talknet_root: Path to TalkNet source directory.
         ddffnet_model: Path to DDFFNet model checkpoint.
     """
     video_path = str(Path(video_path).resolve())
@@ -104,7 +106,13 @@ def run_pipeline(
             _timed(
                 "Stage 4: ASD + blur",
                 lambda: _run_stage4(
-                    db, video_path, audio_stream, device, talknet_model, ddffnet_model
+                    db,
+                    video_path,
+                    audio_stream,
+                    device,
+                    talknet_model,
+                    talknet_root,
+                    ddffnet_model,
                 ),
             )
 
@@ -159,10 +167,14 @@ def _run_stage3(db, video_path, cluster_threshold):
     run_stage3(db, video_path, cluster_threshold)
 
 
-def _run_stage4(db, video_path, audio_stream, device, talknet_model, ddffnet_model):
+def _run_stage4(
+    db, video_path, audio_stream, device, talknet_model, talknet_root, ddffnet_model
+):
     from unified_pipeline.stages.enrichment import run_stage4
 
-    run_stage4(db, video_path, audio_stream, device, talknet_model, ddffnet_model)
+    run_stage4(
+        db, video_path, audio_stream, device, talknet_model, talknet_root, ddffnet_model
+    )
 
 
 def _run_stage5(
