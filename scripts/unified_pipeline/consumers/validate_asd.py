@@ -48,12 +48,15 @@ def compare_main_subjects(
 
         # With ASD (normal)
         main_asd = choose_main_person(people)
+        main_asd_score = main_asd.asd_score if main_asd else 0.0
 
-        # Without ASD (zero out scores)
+        # Without ASD (zero out scores, then restore)
+        saved = [(p, p.asd_score) for p in people]
         for p in people:
             p.asd_score = 0.0
         main_no_asd = choose_main_person(people)
-        # Restore (not needed since we're done with this timestamp)
+        for p, s in saved:
+            p.asd_score = s
 
         total += 1
         if main_asd and main_no_asd:
@@ -68,7 +71,7 @@ def compare_main_subjects(
                     asd_wins += 1
                     print(
                         f"  t={t:.1f}s: ASD picks obj {main_asd.sam3_obj_id} "
-                        f"(cx={asd_cx:.0f}, asd={main_asd.asd_score:.2f}) "
+                        f"(cx={asd_cx:.0f}, asd={main_asd_score:.2f}) "
                         f"vs no-ASD obj {main_no_asd.sam3_obj_id} "
                         f"(cx={no_asd_cx:.0f}) — shift {shift:.0f}px"
                     )
