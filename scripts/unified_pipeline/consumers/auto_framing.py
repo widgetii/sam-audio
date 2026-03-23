@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from unified_pipeline.db import AnalysisDB
+from unified_pipeline.db import AnalysisDB, rle_to_mask
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,34 @@ class PersonFrame:
     asd_score: float = 0.0
     blur_score: float = 0.5
     has_face: bool = False
-    face_cx: float | None = None  # face bbox horizontal center, if detected
+    head_cx: float | None = None  # head horizontal center from mask silhouette
+
+
+def _head_cx_from_mask(mask_rle: bytes, top_fraction: float = 0.10) -> float | None:
+    """Compute head horizontal center from the top portion of a mask silhouette.
+
+    Decodes the RLE mask, finds the topmost region (top_fraction of mask height),
+    and returns the horizontal center of that region. Returns None if mask is
+    empty or too small.
+    """
+    mask = rle_to_mask(mask_rle)
+    rows_with_mask = np.where(mask.any(axis=1))[0]
+    if len(rows_with_mask) < 10:
+        return None
+
+    top_row = rows_with_mask[0]
+    bot_row = rows_with_mask[-1]
+    mask_height = bot_row - top_row
+    if mask_height < 20:
+        return None
+
+    head_bottom = top_row + max(1, int(mask_height * top_fraction))
+    head_region = mask[top_row:head_bottom, :]
+    head_cols = np.where(head_region.any(axis=0))[0]
+    if len(head_cols) == 0:
+        return None
+
+    return float((head_cols[0] + head_cols[-1]) / 2)
 
 
 def query_person_data(
@@ -57,19 +84,34 @@ def query_person_data(
         key = (b["shot_id"], b["sam3_obj_id"], round(b["frame_sec"], 3))
         blur_idx[key] = b["blur_score"]
 
-    # Face detection: presence + center x
+    # Face detection presence (for scoring bonus)
     face_dets = db.get_face_detections()
     face_set: set[tuple[int, int]] = set()
-    face_cx_map: dict[tuple[int, int], float] = {}
     for f in face_dets:
-        key = (f["shot_id"], f["sam3_obj_id"])
-        face_set.add(key)
-        face_cx_map[key] = (f["face_bbox_x1"] + f["face_bbox_x2"]) / 2
+        face_set.add((f["shot_id"], f["sam3_obj_id"]))
+
+    # Fetch mask_rle for head_cx computation
+    mask_rows = db.conn.execute(
+        "SELECT shot_id, sam3_obj_id, frame_sec, mask_rle "
+        "FROM person_tracks WHERE frame_sec BETWEEN ? AND ? AND mask_rle IS NOT NULL",
+        (start_sec, end_sec),
+    ).fetchall()
+    mask_idx: dict[tuple, bytes] = {}
+    for m in mask_rows:
+        key = (m[0], m[1], round(m[2], 3))
+        mask_idx[key] = m[3]
 
     result = []
     for t in tracks:
         sec_key = round(t["frame_sec"], 3)
         key = (t["shot_id"], t["sam3_obj_id"], sec_key)
+
+        # Compute head_cx from mask silhouette
+        head_cx = None
+        mask_data = mask_idx.get(key)
+        if mask_data:
+            head_cx = _head_cx_from_mask(mask_data)
+
         result.append(
             PersonFrame(
                 sam3_obj_id=t["sam3_obj_id"],
@@ -80,7 +122,7 @@ def query_person_data(
                 asd_score=speaker_idx.get(key, 0.0),
                 blur_score=blur_idx.get(key, 0.5),
                 has_face=(t["shot_id"], t["sam3_obj_id"]) in face_set,
-                face_cx=face_cx_map.get((t["shot_id"], t["sam3_obj_id"])),
+                head_cx=head_cx,
             )
         )
     return result
@@ -168,12 +210,20 @@ def interpolate_tracks_to_fps(
 
             if before.frame_sec == after.frame_sec:
                 interp_bbox = before.bbox
+                interp_head_cx = before.head_cx
             else:
                 frac = (t_round - before.frame_sec) / (
                     after.frame_sec - before.frame_sec
                 )
                 frac = max(0.0, min(1.0, frac))
                 interp_bbox = interpolate_bbox(before.bbox, after.bbox, frac)
+                # Interpolate head_cx if both keyframes have it
+                if before.head_cx is not None and after.head_cx is not None:
+                    interp_head_cx = (
+                        before.head_cx + (after.head_cx - before.head_cx) * frac
+                    )
+                else:
+                    interp_head_cx = before.head_cx or after.head_cx
 
             result[t_round].append(
                 PersonFrame(
@@ -185,7 +235,7 @@ def interpolate_tracks_to_fps(
                     asd_score=before.asd_score,
                     blur_score=before.blur_score,
                     has_face=before.has_face,
-                    face_cx=before.face_cx,
+                    head_cx=interp_head_cx,
                 )
             )
 
@@ -242,9 +292,9 @@ def compute_crop_positions(
     for t in sorted(interp.keys()):
         main = choose_main_person(interp[t])
         if main is not None:
-            # Center crop on face if detected, otherwise person bbox center
-            if main.face_cx is not None:
-                target_cx = main.face_cx
+            # Center crop on head (from mask), fall back to bbox center
+            if main.head_cx is not None:
+                target_cx = main.head_cx
             else:
                 target_cx = (main.bbox[0] + main.bbox[2]) / 2
             crop_x = int(target_cx - crop_w / 2)
