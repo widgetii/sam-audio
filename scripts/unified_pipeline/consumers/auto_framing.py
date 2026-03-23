@@ -313,7 +313,7 @@ def render_vertical_video(
         "-map",
         "0:v:0",
         "-map",
-        f"1:a:{audio_stream}",
+        f"1:{audio_stream}",
         "-c:v",
         "libx264",
         "-preset",
