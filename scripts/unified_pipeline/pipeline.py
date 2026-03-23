@@ -48,6 +48,7 @@ def run_pipeline(
     talknet_model: str | None = None,
     talknet_root: str | None = None,
     ddffnet_model: str | None = None,
+    tracking_fps: float | None = None,
 ):
     """Run the unified video analysis pipeline.
 
@@ -64,6 +65,7 @@ def run_pipeline(
         talknet_model: Path to TalkNet model checkpoint.
         talknet_root: Path to TalkNet source directory.
         ddffnet_model: Path to DDFFNet model checkpoint.
+        tracking_fps: SAM3 tracking fps (default: native video fps).
     """
     video_path = str(Path(video_path).resolve())
     if not Path(video_path).exists():
@@ -91,9 +93,12 @@ def run_pipeline(
             _timed("Stage 1: Scene grouping", lambda: _run_stage1(db, video_path))
 
         if 2 in stage_set:
+            tfps = tracking_fps or fps
             _timed(
-                "Stage 2: SAM3 tracking",
-                lambda: _run_stage2(db, video_path, audio_stream, device, store_masks),
+                f"Stage 2: SAM3 tracking @ {tfps}fps",
+                lambda: _run_stage2(
+                    db, video_path, audio_stream, device, store_masks, tfps
+                ),
             )
 
         if 3 in stage_set:
@@ -155,10 +160,10 @@ def _run_stage1(db, video_path):
     run_stage1(db, video_path)
 
 
-def _run_stage2(db, video_path, audio_stream, device, store_masks):
+def _run_stage2(db, video_path, audio_stream, device, store_masks, tracking_fps):
     from unified_pipeline.stages.sam3_tracking import run_stage2
 
-    run_stage2(db, video_path, audio_stream, device, store_masks)
+    run_stage2(db, video_path, audio_stream, device, store_masks, tracking_fps)
 
 
 def _run_stage3(db, video_path, cluster_threshold):

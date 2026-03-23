@@ -22,10 +22,14 @@ log = logging.getLogger(__name__)
 STAGE = "stage2"
 
 
-def _decode_frames_at_1fps(
-    video_path: str, start_sec: float, end_sec: float, output_dir: str
+def _decode_frames(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    output_dir: str,
+    fps: float = 1.0,
 ) -> list[tuple[float, str]]:
-    """Decode frames at 1fps from a video segment, return (timestamp, path) pairs."""
+    """Decode frames at given fps from a video segment, return (timestamp, path) pairs."""
     duration = end_sec - start_sec
     if duration < 0.1:
         return []
@@ -43,16 +47,17 @@ def _decode_frames_at_1fps(
         "-i",
         video_path,
         "-vf",
-        "fps=1",
+        f"fps={fps}",
         "-qscale:v",
         "2",
         pattern,
     ]
     subprocess.run(cmd, check=True)
 
+    dt = 1.0 / fps
     frames = []
     for i, path in enumerate(sorted(Path(output_dir).glob("frame_*.jpg"))):
-        t = start_sec + i  # 1fps => each frame is 1 second apart
+        t = start_sec + i * dt
         frames.append((t, str(path)))
 
     return frames
@@ -72,8 +77,9 @@ def run_stage2(
     audio_stream: int = 0,
     device: str = "cuda",
     store_masks: bool = True,
+    tracking_fps: float = 1.0,
 ):
-    """Run SAM3 person tracking at 1fps for every shot.
+    """Run SAM3 person tracking for every shot.
 
     Args:
         db: Analysis database.
@@ -81,6 +87,7 @@ def run_stage2(
         audio_stream: Audio stream index (unused here, passed for consistency).
         device: CUDA device.
         store_masks: Whether to store RLE masks (large but needed for SAM-Audio visual sep).
+        tracking_fps: Frames per second to track at (default 1.0).
     """
     shots = db.get_shots()
     if not shots:
@@ -92,7 +99,10 @@ def run_stage2(
         log.info("Stage 2: all shots already tracked, skipping")
         return
 
-    log.info(f"Stage 2: tracking persons in {len(remaining)}/{len(shots)} shots")
+    log.info(
+        f"Stage 2: tracking persons in {len(remaining)}/{len(shots)} shots "
+        f"at {tracking_fps}fps"
+    )
 
     # Load SAM3
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -102,7 +112,7 @@ def run_stage2(
     sam3.model.to(device)
 
     try:
-        _process_shots(db, sam3, video_path, remaining, store_masks)
+        _process_shots(db, sam3, video_path, remaining, store_masks, tracking_fps)
     finally:
         sam3.model.to("cpu")
         import torch
@@ -111,7 +121,12 @@ def run_stage2(
 
 
 def _process_shots(
-    db: AnalysisDB, sam3, video_path: str, shots: list[dict], store_masks: bool
+    db: AnalysisDB,
+    sam3,
+    video_path: str,
+    shots: list[dict],
+    store_masks: bool,
+    tracking_fps: float = 1.0,
 ):
     from PIL import Image
 
@@ -121,8 +136,8 @@ def _process_shots(
         shot_id = shot["shot_id"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            frames = _decode_frames_at_1fps(
-                video_path, shot["start_sec"], shot["end_sec"], tmpdir
+            frames = _decode_frames(
+                video_path, shot["start_sec"], shot["end_sec"], tmpdir, tracking_fps
             )
 
             if len(frames) == 0:

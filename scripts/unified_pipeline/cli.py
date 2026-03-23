@@ -46,6 +46,7 @@ def cmd_extract(args):
         talknet_model=args.talknet_model,
         talknet_root=args.talknet_root,
         ddffnet_model=args.ddffnet_model,
+        tracking_fps=args.tracking_fps,
     )
 
 
@@ -183,6 +184,12 @@ def main():
         "--talknet-root", help="TalkNet source directory (contains talkNet.py)"
     )
     p_extract.add_argument("--ddffnet-model", help="DDFFNet model checkpoint path")
+    p_extract.add_argument(
+        "--tracking-fps",
+        type=float,
+        default=None,
+        help="SAM3 tracking fps (default: native video fps)",
+    )
     p_extract.set_defaults(func=cmd_extract)
 
     # auto-frame
