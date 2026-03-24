@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from unified_pipeline.db import AnalysisDB, rle_to_mask
+from unified_pipeline.db import AnalysisDB
 
 log = logging.getLogger(__name__)
 
@@ -36,33 +36,6 @@ class PersonFrame:
     blur_score: float = 0.5
     has_face: bool = False
     head_cx: float | None = None  # head horizontal center from mask silhouette
-
-
-def _head_cx_from_mask(mask_rle: bytes, top_fraction: float = 0.10) -> float | None:
-    """Compute head horizontal center from the top portion of a mask silhouette.
-
-    Decodes the RLE mask, finds the topmost region (top_fraction of mask height),
-    and returns the horizontal center of that region. Returns None if mask is
-    empty or too small.
-    """
-    mask = rle_to_mask(mask_rle)
-    rows_with_mask = np.where(mask.any(axis=1))[0]
-    if len(rows_with_mask) < 10:
-        return None
-
-    top_row = rows_with_mask[0]
-    bot_row = rows_with_mask[-1]
-    mask_height = bot_row - top_row
-    if mask_height < 20:
-        return None
-
-    head_bottom = top_row + max(1, int(mask_height * top_fraction))
-    head_region = mask[top_row:head_bottom, :]
-    head_cols = np.where(head_region.any(axis=0))[0]
-    if len(head_cols) == 0:
-        return None
-
-    return float((head_cols[0] + head_cols[-1]) / 2)
 
 
 def query_person_data(
@@ -90,27 +63,10 @@ def query_person_data(
     for f in face_dets:
         face_set.add((f["shot_id"], f["sam3_obj_id"]))
 
-    # Fetch mask_rle for head_cx computation
-    mask_rows = db.conn.execute(
-        "SELECT shot_id, sam3_obj_id, frame_sec, mask_rle "
-        "FROM person_tracks WHERE frame_sec BETWEEN ? AND ? AND mask_rle IS NOT NULL",
-        (start_sec, end_sec),
-    ).fetchall()
-    mask_idx: dict[tuple, bytes] = {}
-    for m in mask_rows:
-        key = (m[0], m[1], round(m[2], 3))
-        mask_idx[key] = m[3]
-
     result = []
     for t in tracks:
         sec_key = round(t["frame_sec"], 3)
         key = (t["shot_id"], t["sam3_obj_id"], sec_key)
-
-        # Compute head_cx from mask silhouette
-        head_cx = None
-        mask_data = mask_idx.get(key)
-        if mask_data:
-            head_cx = _head_cx_from_mask(mask_data)
 
         result.append(
             PersonFrame(
@@ -122,7 +78,7 @@ def query_person_data(
                 asd_score=speaker_idx.get(key, 0.0),
                 blur_score=blur_idx.get(key, 0.5),
                 has_face=(t["shot_id"], t["sam3_obj_id"]) in face_set,
-                head_cx=head_cx,
+                head_cx=t.get("head_cx"),
             )
         )
     return result

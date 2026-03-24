@@ -116,11 +116,22 @@ CREATE TABLE IF NOT EXISTS person_tracks (
     bbox_y1     REAL NOT NULL,
     bbox_x2     REAL NOT NULL,
     bbox_y2     REAL NOT NULL,
+    head_cx     REAL,
     mask_rle    BLOB,
     FOREIGN KEY (shot_id) REFERENCES shots(shot_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pt_shot ON person_tracks(shot_id);
 CREATE INDEX IF NOT EXISTS idx_pt_sec  ON person_tracks(frame_sec);
+
+CREATE TABLE IF NOT EXISTS mask_videos (
+    shot_id     INTEGER PRIMARY KEY,
+    video_path  TEXT NOT NULL,
+    fps         REAL NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    frame_count INTEGER NOT NULL,
+    FOREIGN KEY (shot_id) REFERENCES shots(shot_id)
+);
 
 CREATE TABLE IF NOT EXISTS track_identities (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,13 +303,24 @@ class AnalysisDB:
     def insert_person_tracks(self, tracks: list[dict]):
         """Batch insert person track rows.
 
-        Each dict: shot_id, sam3_obj_id, frame_sec, bbox_x1..y2, mask_rle (optional bytes).
+        Each dict: shot_id, sam3_obj_id, frame_sec, bbox_x1..y2,
+        head_cx (optional float), mask_rle (optional bytes).
         """
         self.conn.executemany(
             "INSERT INTO person_tracks "
-            "(shot_id, sam3_obj_id, frame_sec, bbox_x1, bbox_y1, bbox_x2, bbox_y2, mask_rle) "
-            "VALUES (:shot_id, :sam3_obj_id, :frame_sec, :bbox_x1, :bbox_y1, :bbox_x2, :bbox_y2, :mask_rle)",
+            "(shot_id, sam3_obj_id, frame_sec, bbox_x1, bbox_y1, bbox_x2, bbox_y2, head_cx, mask_rle) "
+            "VALUES (:shot_id, :sam3_obj_id, :frame_sec, :bbox_x1, :bbox_y1, :bbox_x2, :bbox_y2, :head_cx, :mask_rle)",
             tracks,
+        )
+        self.conn.commit()
+
+    def insert_mask_video(self, row: dict):
+        """Insert a mask video metadata row."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mask_videos "
+            "(shot_id, video_path, fps, width, height, frame_count) "
+            "VALUES (:shot_id, :video_path, :fps, :width, :height, :frame_count)",
+            row,
         )
         self.conn.commit()
 

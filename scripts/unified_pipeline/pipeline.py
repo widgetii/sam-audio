@@ -97,7 +97,7 @@ def run_pipeline(
             _timed(
                 f"Stage 2: SAM3 tracking @ {tfps}fps",
                 lambda: _run_stage2(
-                    db, video_path, audio_stream, device, store_masks, tfps
+                    db, video_path, audio_stream, device, store_masks, tfps, db_file
                 ),
             )
 
@@ -160,10 +160,19 @@ def _run_stage1(db, video_path):
     run_stage1(db, video_path)
 
 
-def _run_stage2(db, video_path, audio_stream, device, store_masks, tracking_fps):
+def _run_stage2(
+    db, video_path, audio_stream, device, store_masks, tracking_fps, db_file
+):
+    from pathlib import Path
+
     from unified_pipeline.stages.sam3_tracking import run_stage2
 
-    run_stage2(db, video_path, audio_stream, device, store_masks, tracking_fps)
+    masks_dir = str(
+        Path(db_file).parent / Path(db_file).stem.replace(".analysis", ".masks")
+    )
+    run_stage2(
+        db, video_path, audio_stream, device, store_masks, tracking_fps, masks_dir
+    )
 
 
 def _run_stage3(db, video_path, cluster_threshold):
