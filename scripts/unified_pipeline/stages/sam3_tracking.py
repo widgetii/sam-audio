@@ -14,6 +14,7 @@ individual RLE blobs. head_cx is precomputed from the mask silhouette.
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -278,55 +279,90 @@ def _process_shots(
         if store_masks:
             encoder = _open_label_map_encoder(mask_path, tracking_fps, vid_w, vid_h)
 
-        # Process in chunks to avoid OOM
+        # Process in chunks with prefetch — decode next chunk while
+        # SAM3 processes current one to keep GPU busy
         dt = 1.0 / tracking_fps
         chunk_idx = 0
         frames_processed = 0
 
-        try:
-            while frames_processed < total_frames:
-                chunk_size = min(MAX_FRAMES_PER_CHUNK, total_frames - frames_processed)
-                chunk_start_sec = shot["start_sec"] + frames_processed * dt
-                chunk_end_sec = min(chunk_start_sec + chunk_size * dt, shot["end_sec"])
+        def _make_chunk_params(
+            fp,
+            _total=total_frames,
+            _start=shot["start_sec"],
+            _end=shot["end_sec"],
+            _dt=dt,
+        ):
+            cs = min(MAX_FRAMES_PER_CHUNK, _total - fp)
+            cs_sec = _start + fp * _dt
+            ce_sec = min(cs_sec + cs * _dt, _end)
+            return cs_sec, ce_sec, cs
 
-                frames = _decode_frames_pipe(
+        try:
+            with ThreadPoolExecutor(max_workers=1) as prefetch:
+                # Start decoding first chunk
+                c_start, c_end, c_size = _make_chunk_params(frames_processed)
+                future = prefetch.submit(
+                    _decode_frames_pipe,
                     video_path,
-                    chunk_start_sec,
-                    chunk_end_sec,
+                    c_start,
+                    c_end,
                     tracking_fps,
                     vid_w,
                     vid_h,
-                    max_frames=chunk_size,
+                    c_size,
                 )
 
-                if not frames:
-                    break
+                while frames_processed < total_frames:
+                    frames = future.result()
+                    if not frames:
+                        break
 
-                pil_frames = [f for _, f in frames]
-                timestamps = [t for t, _ in frames]
-                obj_id_offset = chunk_idx * 1000
+                    next_fp = frames_processed + len(frames)
 
-                tracks, label_maps = _track_persons_in_shot(
-                    sam3,
-                    pil_frames,
-                    timestamps,
-                    shot_id,
-                    vid_w,
-                    vid_h,
-                    obj_id_offset,
-                )
-                shot_tracks.extend(tracks)
+                    # Prefetch next chunk while we process this one
+                    next_future = None
+                    if next_fp < total_frames:
+                        nc_start, nc_end, nc_size = _make_chunk_params(next_fp)
+                        next_future = prefetch.submit(
+                            _decode_frames_pipe,
+                            video_path,
+                            nc_start,
+                            nc_end,
+                            tracking_fps,
+                            vid_w,
+                            vid_h,
+                            nc_size,
+                        )
 
-                # Stream label maps to encoder immediately
-                if encoder is not None:
-                    for lm in label_maps:
-                        encoder.stdin.write(lm.tobytes())
-                        total_label_frames += 1
-                    del label_maps
+                    pil_frames = [f for _, f in frames]
+                    timestamps = [t for t, _ in frames]
+                    obj_id_offset = chunk_idx * 1000
 
-                frames_processed += len(frames)
-                chunk_idx += 1
-                del pil_frames, frames
+                    tracks, label_maps = _track_persons_in_shot(
+                        sam3,
+                        pil_frames,
+                        timestamps,
+                        shot_id,
+                        vid_w,
+                        vid_h,
+                        obj_id_offset,
+                    )
+                    shot_tracks.extend(tracks)
+
+                    # Stream label maps to encoder
+                    if encoder is not None:
+                        for lm in label_maps:
+                            encoder.stdin.write(lm.tobytes())
+                            total_label_frames += 1
+                        del label_maps
+
+                    frames_processed = next_fp
+                    chunk_idx += 1
+                    del pil_frames, frames
+
+                    if next_future is None:
+                        break
+                    future = next_future
         finally:
             if encoder is not None:
                 encoder.stdin.close()
