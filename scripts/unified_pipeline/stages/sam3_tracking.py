@@ -14,6 +14,7 @@ videos (one per shot). head_cx is precomputed from the mask silhouette.
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -26,15 +27,14 @@ log = logging.getLogger(__name__)
 
 STAGE = "stage2"
 
-# Max frames per SAM3 session to avoid OOM
 MAX_FRAMES_PER_CHUNK = 200
-
-# Head region: top fraction of mask silhouette for head_cx computation
 HEAD_TOP_FRACTION = 0.10
+SAM3_IMAGE_SIZE = 1008
+SAM3_MEAN = 0.5
+SAM3_STD = 0.5
 
 
 def _get_video_dimensions(video_path: str) -> tuple[int, int]:
-    """Get video width and height via ffprobe."""
     probe = subprocess.run(
         [
             "ffprobe",
@@ -56,25 +56,16 @@ def _get_video_dimensions(video_path: str) -> tuple[int, int]:
     return w, h
 
 
-SAM3_IMAGE_SIZE = 1008
-SAM3_MEAN = 0.5
-SAM3_STD = 0.5
-
-
 def _decode_frames_to_gpu(
-    video_path: str,
-    start_sec: float,
-    end_sec: float,
-    fps: float,
-    vid_w: int,
-    vid_h: int,
-    max_frames: int = 0,
-) -> tuple[torch.Tensor | None, list[float]]:
-    """Decode frames via ffmpeg pipe → GPU tensors, pre-processed for SAM3.
-
-    Returns (tensor [N,3,1008,1008] float16 on CUDA, list of timestamps).
-    Resize and normalize happen on GPU — no PIL involved.
-    """
+    video_path,
+    start_sec,
+    end_sec,
+    fps,
+    vid_w,
+    vid_h,
+    max_frames=0,
+):
+    """Decode frames via ffmpeg pipe → GPU tensors, pre-processed for SAM3."""
     duration = end_sec - start_sec
     if duration < 0.04:
         return None, []
@@ -102,7 +93,6 @@ def _decode_frames_to_gpu(
 
     frame_bytes = vid_w * vid_h * 3
     dt = 1.0 / fps
-
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     tensors = []
     timestamps = []
@@ -114,7 +104,6 @@ def _decode_frames_to_gpu(
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
-            # Raw bytes → GPU tensor, resize + normalize on GPU
             t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(
                 vid_h, vid_w, 3
             )
@@ -136,20 +125,17 @@ def _decode_frames_to_gpu(
 
     if not tensors:
         return None, []
-
     return torch.stack(tensors), timestamps
 
 
-def _bbox_from_mask(mask: np.ndarray) -> tuple[float, float, float, float]:
-    """Extract bounding box (x1, y1, x2, y2) from a binary mask."""
+def _bbox_from_mask(mask):
     ys, xs = np.where(mask)
     if len(ys) == 0:
         return (0.0, 0.0, 0.0, 0.0)
     return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
 
 
-def _head_cx_from_mask(mask: np.ndarray) -> float | None:
-    """Compute head horizontal center from the top portion of a mask silhouette."""
+def _head_cx_from_mask(mask):
     rows_with_mask = np.where(mask.any(axis=1))[0]
     if len(rows_with_mask) < 10:
         return None
@@ -166,13 +152,7 @@ def _head_cx_from_mask(mask: np.ndarray) -> float | None:
     return float((head_cols[0] + head_cols[-1]) / 2)
 
 
-def _open_label_map_encoder(
-    output_path: str,
-    fps: float,
-    vid_w: int,
-    vid_h: int,
-) -> subprocess.Popen:
-    """Open a streaming FFV1 encoder. Write grayscale label maps to stdin."""
+def _open_label_map_encoder(output_path, fps, vid_w, vid_h):
     cmd = [
         "ffmpeg",
         "-y",
@@ -210,17 +190,6 @@ def run_stage2(
     tracking_fps: float = 1.0,
     masks_dir: str | None = None,
 ):
-    """Run SAM3 person tracking for every shot.
-
-    Args:
-        db: Analysis database.
-        video_path: Path to source video.
-        audio_stream: Unused, for interface consistency.
-        device: CUDA device.
-        store_masks: Whether to store masks (as FFV1 video files).
-        tracking_fps: Frames per second to track at.
-        masks_dir: Directory for mask video files. Auto-derived if None.
-    """
     shots = db.get_shots()
     if not shots:
         raise RuntimeError("Stage 2: no shots in DB — run stages 0-1 first")
@@ -238,14 +207,12 @@ def run_stage2(
 
     vid_w, vid_h = _get_video_dimensions(video_path)
 
-    # Create masks directory
     if masks_dir is None:
         masks_dir = str(
             db.db_file.parent / db.db_file.stem.replace(".analysis", ".masks")
         )
     Path(masks_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load SAM3
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -266,125 +233,144 @@ def run_stage2(
         )
     finally:
         sam3.model.to("cpu")
-        import torch
-
         torch.cuda.empty_cache()
 
 
 def _process_shots(
-    db: AnalysisDB,
+    db,
     sam3,
-    video_path: str,
-    shots: list[dict],
-    store_masks: bool,
-    tracking_fps: float,
-    vid_w: int,
-    vid_h: int,
-    masks_dir: str,
+    video_path,
+    shots,
+    store_masks,
+    tracking_fps,
+    vid_w,
+    vid_h,
+    masks_dir,
 ):
+    """Process shots with prefetch decode.
+
+    Decodes next chunk in a background thread while SAM3 runs on current chunk.
+    """
     total_tracks = 0
+    dt = 1.0 / tracking_fps
 
-    for shot_idx, shot in enumerate(shots):
-        shot_id = shot["shot_id"]
-        shot_duration = shot["end_sec"] - shot["start_sec"]
-        total_frames = int(shot_duration * tracking_fps) + 1
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="decode") as pool:
+        for shot_idx, shot in enumerate(shots):
+            shot_id = shot["shot_id"]
+            shot_duration = shot["end_sec"] - shot["start_sec"]
+            total_frames = int(shot_duration * tracking_fps) + 1
 
-        if total_frames == 0:
-            db.mark_progress(STAGE, str(shot_id), "done")
-            continue
+            if total_frames == 0:
+                db.mark_progress(STAGE, str(shot_id), "done")
+                continue
 
-        shot_tracks = []
-        total_label_frames = 0
+            shot_tracks = []
+            total_label_frames = 0
 
-        # Open streaming FFV1 encoder for this shot's mask video
-        mask_path = os.path.join(masks_dir, f"shot_{shot_id:04d}.mkv")
-        encoder = None
-        if store_masks:
-            encoder = _open_label_map_encoder(mask_path, tracking_fps, vid_w, vid_h)
+            mask_path = os.path.join(masks_dir, f"shot_{shot_id:04d}.mkv")
+            encoder = None
+            if store_masks:
+                encoder = _open_label_map_encoder(mask_path, tracking_fps, vid_w, vid_h)
 
-        # Process in chunks — decode to GPU tensors, run SAM3, write FFV1
-        dt = 1.0 / tracking_fps
-        chunk_idx = 0
-        frames_processed = 0
+            chunk_idx = 0
+            frames_processed = 0
 
-        try:
-            while frames_processed < total_frames:
-                chunk_size = min(MAX_FRAMES_PER_CHUNK, total_frames - frames_processed)
-                chunk_start_sec = shot["start_sec"] + frames_processed * dt
-                chunk_end_sec = min(chunk_start_sec + chunk_size * dt, shot["end_sec"])
+            # Submit first decode
+            cs = min(MAX_FRAMES_PER_CHUNK, total_frames)
+            future = pool.submit(
+                _decode_frames_to_gpu,
+                video_path,
+                shot["start_sec"],
+                min(shot["start_sec"] + cs * dt, shot["end_sec"]),
+                tracking_fps,
+                vid_w,
+                vid_h,
+                cs,
+            )
 
-                images_tensor, timestamps = _decode_frames_to_gpu(
-                    video_path,
-                    chunk_start_sec,
-                    chunk_end_sec,
-                    tracking_fps,
-                    vid_w,
-                    vid_h,
-                    max_frames=chunk_size,
-                )
+            try:
+                while frames_processed < total_frames:
+                    images_tensor, timestamps = future.result()
 
-                if images_tensor is None:
-                    break
+                    n_decoded = len(timestamps) if timestamps else 0
+                    next_fp = frames_processed + n_decoded
 
-                obj_id_offset = chunk_idx * 1000
+                    # Prefetch next chunk
+                    next_future = None
+                    if next_fp < total_frames:
+                        next_cs = min(MAX_FRAMES_PER_CHUNK, total_frames - next_fp)
+                        next_start = shot["start_sec"] + next_fp * dt
+                        next_end = min(next_start + next_cs * dt, shot["end_sec"])
+                        next_future = pool.submit(
+                            _decode_frames_to_gpu,
+                            video_path,
+                            next_start,
+                            next_end,
+                            tracking_fps,
+                            vid_w,
+                            vid_h,
+                            next_cs,
+                        )
 
-                tracks, label_maps = _track_persons_in_shot(
-                    sam3,
-                    images_tensor,
-                    timestamps,
-                    shot_id,
-                    vid_w,
-                    vid_h,
-                    obj_id_offset,
-                )
-                shot_tracks.extend(tracks)
+                    if images_tensor is None:
+                        break
 
-                # Stream label maps to encoder
+                    tracks, label_maps = _track_persons_in_shot(
+                        sam3,
+                        images_tensor,
+                        timestamps,
+                        shot_id,
+                        vid_w,
+                        vid_h,
+                        chunk_idx * 1000,
+                    )
+                    shot_tracks.extend(tracks)
+
+                    if encoder is not None:
+                        for lm in label_maps:
+                            encoder.stdin.write(lm.tobytes())
+                            total_label_frames += 1
+                        del label_maps
+
+                    frames_processed = next_fp
+                    chunk_idx += 1
+                    del images_tensor
+
+                    if next_future is None:
+                        break
+                    future = next_future
+            finally:
                 if encoder is not None:
-                    for lm in label_maps:
-                        encoder.stdin.write(lm.tobytes())
-                        total_label_frames += 1
-                    del label_maps
+                    encoder.stdin.close()
+                    encoder.wait()
 
-                frames_processed += len(timestamps)
-                chunk_idx += 1
-                del images_tensor
-        finally:
-            if encoder is not None:
-                encoder.stdin.close()
-                encoder.wait()
+            if shot_tracks:
+                db.insert_person_tracks(shot_tracks)
+                total_tracks += len(shot_tracks)
 
-        if shot_tracks:
-            db.insert_person_tracks(shot_tracks)
-            total_tracks += len(shot_tracks)
+            if store_masks and total_label_frames > 0:
+                db.insert_mask_video(
+                    {
+                        "shot_id": shot_id,
+                        "video_path": os.path.basename(mask_path),
+                        "fps": tracking_fps,
+                        "width": vid_w,
+                        "height": vid_h,
+                        "frame_count": total_label_frames,
+                    }
+                )
 
-        if store_masks and total_label_frames > 0:
-            db.insert_mask_video(
-                {
-                    "shot_id": shot_id,
-                    "video_path": os.path.basename(mask_path),
-                    "fps": tracking_fps,
-                    "width": vid_w,
-                    "height": vid_h,
-                    "frame_count": total_label_frames,
-                }
-            )
+            db.mark_progress(STAGE, str(shot_id), "done")
 
-        db.mark_progress(STAGE, str(shot_id), "done")
-
-        if (shot_idx + 1) % 50 == 0 or shot_idx == len(shots) - 1:
-            log.info(
-                f"Stage 2: {shot_idx + 1}/{len(shots)} shots done, "
-                f"{total_tracks} track rows total"
-            )
+            if (shot_idx + 1) % 50 == 0 or shot_idx == len(shots) - 1:
+                log.info(
+                    f"Stage 2: {shot_idx + 1}/{len(shots)} shots done, "
+                    f"{total_tracks} track rows total"
+                )
 
 
 def _init_sam3_state_from_tensor(sam3_model, images_tensor, orig_h, orig_w):
-    """Initialize SAM3 inference state from a pre-processed GPU tensor.
-
-    Bypasses load_resource_as_video_frames — tensor is already on GPU,
-    resized to 1008x1008, and normalized.
-    """
+    """Initialize SAM3 inference state from a pre-processed GPU tensor."""
     inference_state = {}
     inference_state["image_size"] = sam3_model.image_size
     inference_state["num_frames"] = len(images_tensor)
@@ -403,21 +389,18 @@ def _init_sam3_state_from_tensor(sam3_model, images_tensor, orig_h, orig_w):
 
 def _track_persons_in_shot(
     sam3,
-    images_tensor: torch.Tensor,
-    timestamps: list[float],
-    shot_id: int,
-    vid_w: int,
-    vid_h: int,
-    obj_id_offset: int = 0,
-) -> tuple[list[dict], list[np.ndarray]]:
-    """Run SAM3 text="person" on pre-processed GPU frames.
-
-    images_tensor: [N, 3, 1008, 1008] float16 on CUDA.
-    """
+    images_tensor,
+    timestamps,
+    shot_id,
+    vid_w,
+    vid_h,
+    obj_id_offset=0,
+):
+    """Run SAM3 text='person' on pre-processed GPU frames."""
     if images_tensor is None or len(images_tensor) == 0:
         return [], []
 
-    # Initialize SAM3 session directly from tensor (bypass PIL path)
+    import time
     import uuid
 
     inference_state = _init_sam3_state_from_tensor(
@@ -427,7 +410,7 @@ def _track_persons_in_shot(
     sam3._ALL_INFERENCE_STATES[session_id] = {
         "state": inference_state,
         "session_id": session_id,
-        "start_time": __import__("time").time(),
+        "start_time": time.time(),
     }
 
     try:
@@ -442,7 +425,6 @@ def _track_persons_in_shot(
 
         outputs = response.get("outputs")
         if outputs is None or len(outputs.get("out_obj_ids", [])) == 0:
-            # No detections — return empty label maps (all background)
             n_frames = len(images_tensor)
             empty_maps = [
                 np.zeros((vid_h, vid_w), dtype=np.uint8) for _ in range(n_frames)
@@ -473,7 +455,6 @@ def _track_persons_in_shot(
             ):
                 per_frame.setdefault(fi, {})[int(obj_id)] = mask
 
-        # Build track rows + label maps
         track_rows = []
         label_maps = []
 
@@ -504,8 +485,6 @@ def _track_persons_in_shot(
                         }
                     )
 
-                    # Label map: pixel = effective_id + 1 (0 = background)
-                    # Clamp to uint8 range
                     label_val = min(effective_id + 1, 255)
                     label_map[mask > 0] = label_val
 
