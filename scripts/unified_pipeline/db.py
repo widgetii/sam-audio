@@ -229,7 +229,9 @@ class AnalysisDB:
 
     def __init__(self, db_file: str | Path):
         self.db_file = Path(db_file)
-        self.conn = sqlite3.connect(str(self.db_file), timeout=30)
+        self.conn = sqlite3.connect(
+            str(self.db_file), timeout=30, check_same_thread=False
+        )
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.row_factory = sqlite3.Row
