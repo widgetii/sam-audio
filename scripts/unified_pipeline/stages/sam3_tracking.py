@@ -377,6 +377,8 @@ def run_stage2(
     for i in range(n_workers):
         sam3 = build_sam3_video_predictor()
         sam3.model.to(device)
+        # Give each instance its own session dict to avoid cross-thread interference
+        sam3._ALL_INFERENCE_STATES = {}
         vram_gb = torch.cuda.memory_allocated(0) / 1e9
         log.info(f"SAM3 instance {i} loaded, total VRAM used: {vram_gb:.1f}GB")
         sam3_instances.append(sam3)
