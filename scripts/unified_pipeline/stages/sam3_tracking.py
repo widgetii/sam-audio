@@ -368,7 +368,12 @@ def run_stage2(
 
     # Determine worker count: each SAM3 instance ~10GB VRAM, keep 10GB headroom
     total_vram = torch.cuda.get_device_properties(0).total_memory
-    n_workers = min(4, max(1, int((total_vram - 10 * 1024**3) / (10 * 1024**3))))
+    n_remaining = len(remaining)
+    # Use fewer workers for small batches or retries to avoid contention
+    max_workers = 4 if n_remaining > 200 else 1
+    n_workers = min(
+        max_workers, max(1, int((total_vram - 10 * 1024**3) / (10 * 1024**3)))
+    )
 
     log.info(
         f"Stage 2: tracking {len(remaining)}/{len(shots)} shots "
