@@ -241,6 +241,8 @@ def _process_one_shot(
                         }
                     )
 
+                if response is None:
+                    response = {}
                 outputs = response.get("outputs")
                 if outputs is None or len(outputs.get("out_obj_ids", [])) == 0:
                     # No detections — write empty label maps
@@ -262,14 +264,17 @@ def _process_one_shot(
                     per_frame.setdefault(0, {})[int(obj_id)] = mask
 
                 with torch.inference_mode(), torch.amp.autocast("cuda"):
-                    for result in sam3.handle_stream_request(
+                    stream = sam3.handle_stream_request(
                         {
                             "type": "propagate_in_video",
                             "session_id": session_id,
                             "propagation_direction": "forward",
                             "start_frame_index": 0,
                         }
-                    ):
+                    )
+                    for result in stream or []:
+                        if result is None:
+                            continue
                         frame_out = result.get("outputs")
                         if frame_out is None:
                             continue
