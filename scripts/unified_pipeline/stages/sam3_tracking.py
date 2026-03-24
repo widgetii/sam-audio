@@ -6,19 +6,19 @@ consistent obj_ids across frames without needing ByteTrack.
 Each shot is a separate SAM3 session. Text prompt "person" detects all
 people on the first frame, then propagates through the shot.
 
-Frames are decoded directly from video via ffmpeg pipe (no disk I/O).
-Masks are stored as FFV1 label-map videos (one per shot) rather than
-individual RLE blobs. head_cx is precomputed from the mask silhouette.
+Frames are decoded via ffmpeg pipe → GPU tensors (no PIL, no disk I/O).
+Resize + normalize happen on GPU. Masks are stored as FFV1 label-map
+videos (one per shot). head_cx is precomputed from the mask silhouette.
 """
 
 import logging
 import os
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+import torch
+import torch.nn.functional as F
 
 from unified_pipeline.db import AnalysisDB
 
@@ -56,7 +56,12 @@ def _get_video_dimensions(video_path: str) -> tuple[int, int]:
     return w, h
 
 
-def _decode_frames_pipe(
+SAM3_IMAGE_SIZE = 1008
+SAM3_MEAN = 0.5
+SAM3_STD = 0.5
+
+
+def _decode_frames_to_gpu(
     video_path: str,
     start_sec: float,
     end_sec: float,
@@ -64,11 +69,15 @@ def _decode_frames_pipe(
     vid_w: int,
     vid_h: int,
     max_frames: int = 0,
-) -> list[tuple[float, Image.Image]]:
-    """Decode frames from video via ffmpeg pipe as raw RGB → PIL Images."""
+) -> tuple[torch.Tensor | None, list[float]]:
+    """Decode frames via ffmpeg pipe → GPU tensors, pre-processed for SAM3.
+
+    Returns (tensor [N,3,1008,1008] float16 on CUDA, list of timestamps).
+    Resize and normalize happen on GPU — no PIL involved.
+    """
     duration = end_sec - start_sec
     if duration < 0.04:
-        return []
+        return None, []
 
     cmd = [
         "ffmpeg",
@@ -95,7 +104,8 @@ def _decode_frames_pipe(
     dt = 1.0 / fps
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    frames = []
+    tensors = []
+    timestamps = []
     try:
         i = 0
         while True:
@@ -104,17 +114,30 @@ def _decode_frames_pipe(
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape(vid_h, vid_w, 3)
-            pil = Image.fromarray(arr)
-            t = start_sec + i * dt
-            frames.append((t, pil))
+            # Raw bytes → GPU tensor, resize + normalize on GPU
+            t = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(
+                vid_h, vid_w, 3
+            )
+            t = t.permute(2, 0, 1).unsqueeze(0).cuda().half() / 255.0
+            t = F.interpolate(
+                t,
+                size=(SAM3_IMAGE_SIZE, SAM3_IMAGE_SIZE),
+                mode="bicubic",
+                align_corners=False,
+            )
+            t = (t - SAM3_MEAN) / SAM3_STD
+            tensors.append(t.squeeze(0))
+            timestamps.append(start_sec + i * dt)
             i += 1
     finally:
         proc.stdout.close()
         proc.terminate()
         proc.wait()
 
-    return frames
+    if not tensors:
+        return None, []
+
+    return torch.stack(tensors), timestamps
 
 
 def _bbox_from_mask(mask: np.ndarray) -> tuple[float, float, float, float]:
@@ -279,90 +302,53 @@ def _process_shots(
         if store_masks:
             encoder = _open_label_map_encoder(mask_path, tracking_fps, vid_w, vid_h)
 
-        # Process in chunks with prefetch — decode next chunk while
-        # SAM3 processes current one to keep GPU busy
+        # Process in chunks — decode to GPU tensors, run SAM3, write FFV1
         dt = 1.0 / tracking_fps
         chunk_idx = 0
         frames_processed = 0
 
-        def _make_chunk_params(
-            fp,
-            _total=total_frames,
-            _start=shot["start_sec"],
-            _end=shot["end_sec"],
-            _dt=dt,
-        ):
-            cs = min(MAX_FRAMES_PER_CHUNK, _total - fp)
-            cs_sec = _start + fp * _dt
-            ce_sec = min(cs_sec + cs * _dt, _end)
-            return cs_sec, ce_sec, cs
-
         try:
-            with ThreadPoolExecutor(max_workers=1) as prefetch:
-                # Start decoding first chunk
-                c_start, c_end, c_size = _make_chunk_params(frames_processed)
-                future = prefetch.submit(
-                    _decode_frames_pipe,
+            while frames_processed < total_frames:
+                chunk_size = min(MAX_FRAMES_PER_CHUNK, total_frames - frames_processed)
+                chunk_start_sec = shot["start_sec"] + frames_processed * dt
+                chunk_end_sec = min(chunk_start_sec + chunk_size * dt, shot["end_sec"])
+
+                images_tensor, timestamps = _decode_frames_to_gpu(
                     video_path,
-                    c_start,
-                    c_end,
+                    chunk_start_sec,
+                    chunk_end_sec,
                     tracking_fps,
                     vid_w,
                     vid_h,
-                    c_size,
+                    max_frames=chunk_size,
                 )
 
-                while frames_processed < total_frames:
-                    frames = future.result()
-                    if not frames:
-                        break
+                if images_tensor is None:
+                    break
 
-                    next_fp = frames_processed + len(frames)
+                obj_id_offset = chunk_idx * 1000
 
-                    # Prefetch next chunk while we process this one
-                    next_future = None
-                    if next_fp < total_frames:
-                        nc_start, nc_end, nc_size = _make_chunk_params(next_fp)
-                        next_future = prefetch.submit(
-                            _decode_frames_pipe,
-                            video_path,
-                            nc_start,
-                            nc_end,
-                            tracking_fps,
-                            vid_w,
-                            vid_h,
-                            nc_size,
-                        )
+                tracks, label_maps = _track_persons_in_shot(
+                    sam3,
+                    images_tensor,
+                    timestamps,
+                    shot_id,
+                    vid_w,
+                    vid_h,
+                    obj_id_offset,
+                )
+                shot_tracks.extend(tracks)
 
-                    pil_frames = [f for _, f in frames]
-                    timestamps = [t for t, _ in frames]
-                    obj_id_offset = chunk_idx * 1000
+                # Stream label maps to encoder
+                if encoder is not None:
+                    for lm in label_maps:
+                        encoder.stdin.write(lm.tobytes())
+                        total_label_frames += 1
+                    del label_maps
 
-                    tracks, label_maps = _track_persons_in_shot(
-                        sam3,
-                        pil_frames,
-                        timestamps,
-                        shot_id,
-                        vid_w,
-                        vid_h,
-                        obj_id_offset,
-                    )
-                    shot_tracks.extend(tracks)
-
-                    # Stream label maps to encoder
-                    if encoder is not None:
-                        for lm in label_maps:
-                            encoder.stdin.write(lm.tobytes())
-                            total_label_frames += 1
-                        del label_maps
-
-                    frames_processed = next_fp
-                    chunk_idx += 1
-                    del pil_frames, frames
-
-                    if next_future is None:
-                        break
-                    future = next_future
+                frames_processed += len(timestamps)
+                chunk_idx += 1
+                del images_tensor
         finally:
             if encoder is not None:
                 encoder.stdin.close()
@@ -393,26 +379,56 @@ def _process_shots(
             )
 
 
+def _init_sam3_state_from_tensor(sam3_model, images_tensor, orig_h, orig_w):
+    """Initialize SAM3 inference state from a pre-processed GPU tensor.
+
+    Bypasses load_resource_as_video_frames — tensor is already on GPU,
+    resized to 1008x1008, and normalized.
+    """
+    inference_state = {}
+    inference_state["image_size"] = sam3_model.image_size
+    inference_state["num_frames"] = len(images_tensor)
+    inference_state["orig_height"] = orig_h
+    inference_state["orig_width"] = orig_w
+    inference_state["constants"] = {}
+    sam3_model._construct_initial_input_batch(inference_state, images_tensor)
+    inference_state["tracker_inference_states"] = []
+    inference_state["tracker_metadata"] = {}
+    inference_state["feature_cache"] = {}
+    inference_state["cached_frame_outputs"] = {}
+    inference_state["action_history"] = []
+    inference_state["is_image_only"] = False
+    return inference_state
+
+
 def _track_persons_in_shot(
     sam3,
-    pil_frames: list,
+    images_tensor: torch.Tensor,
     timestamps: list[float],
     shot_id: int,
     vid_w: int,
     vid_h: int,
     obj_id_offset: int = 0,
 ) -> tuple[list[dict], list[np.ndarray]]:
-    """Run SAM3 text="person" on frames, return (track_rows, label_maps)."""
-    if len(pil_frames) == 0:
+    """Run SAM3 text="person" on pre-processed GPU frames.
+
+    images_tensor: [N, 3, 1008, 1008] float16 on CUDA.
+    """
+    if images_tensor is None or len(images_tensor) == 0:
         return [], []
 
-    response = sam3.handle_request(
-        {
-            "type": "start_session",
-            "resource_path": pil_frames,
-        }
+    # Initialize SAM3 session directly from tensor (bypass PIL path)
+    import uuid
+
+    inference_state = _init_sam3_state_from_tensor(
+        sam3.model, images_tensor, vid_h, vid_w
     )
-    session_id = response["session_id"]
+    session_id = str(uuid.uuid4())
+    sam3._ALL_INFERENCE_STATES[session_id] = {
+        "state": inference_state,
+        "session_id": session_id,
+        "start_time": __import__("time").time(),
+    }
 
     try:
         response = sam3.handle_request(
@@ -427,8 +443,9 @@ def _track_persons_in_shot(
         outputs = response.get("outputs")
         if outputs is None or len(outputs.get("out_obj_ids", [])) == 0:
             # No detections — return empty label maps (all background)
+            n_frames = len(images_tensor)
             empty_maps = [
-                np.zeros((vid_h, vid_w), dtype=np.uint8) for _ in range(len(pil_frames))
+                np.zeros((vid_h, vid_w), dtype=np.uint8) for _ in range(n_frames)
             ]
             return [], empty_maps
 
@@ -460,7 +477,7 @@ def _track_persons_in_shot(
         track_rows = []
         label_maps = []
 
-        for fi in range(len(pil_frames)):
+        for fi in range(len(images_tensor)):
             label_map = np.zeros((vid_h, vid_w), dtype=np.uint8)
 
             if fi in per_frame:
