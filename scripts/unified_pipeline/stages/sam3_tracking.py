@@ -338,69 +338,39 @@ def _process_one_shot(
     return shot_id, shot_tracks, mask_info
 
 
-def run_stage2(
-    db: AnalysisDB,
-    video_path: str,
-    audio_stream: int = 0,
-    device: str = "cuda",
-    store_masks: bool = True,
-    tracking_fps: float = 1.0,
-    masks_dir: str | None = None,
+def _run_workers(
+    db,
+    video_path,
+    shots_to_process,
+    n_workers,
+    device,
+    store_masks,
+    tracking_fps,
+    vid_w,
+    vid_h,
+    masks_dir,
+    pass_label,
 ):
-    shots = db.get_shots()
-    if not shots:
-        raise RuntimeError("Stage 2: no shots in DB — run stages 0-1 first")
-
-    progress = db.get_progress(STAGE)
-    remaining = [s for s in shots if progress.get(str(s["shot_id"])) != "done"]
-    if not remaining:
-        log.info("Stage 2: all shots already tracked, skipping")
-        return
-
-    vid_w, vid_h = _get_video_dimensions(video_path)
-    if masks_dir is None:
-        masks_dir = str(
-            db.db_file.parent / db.db_file.stem.replace(".analysis", ".masks")
-        )
-    Path(masks_dir).mkdir(parents=True, exist_ok=True)
-
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-    # Determine worker count: each SAM3 instance ~10GB VRAM, keep 10GB headroom
-    total_vram = torch.cuda.get_device_properties(0).total_memory
-    n_remaining = len(remaining)
-    # Use fewer workers for small batches or retries to avoid contention
-    max_workers = 4 if n_remaining > 200 else 1
-    n_workers = min(
-        max_workers, max(1, int((total_vram - 10 * 1024**3) / (10 * 1024**3)))
-    )
-
-    log.info(
-        f"Stage 2: tracking {len(remaining)}/{len(shots)} shots "
-        f"at {tracking_fps:.1f}fps with {n_workers} independent SAM3 instances"
-    )
-
-    # Build N independent SAM3 predictors, each with own model weights
+    """Run N SAM3 worker threads on a list of shots. Returns (done_count, track_count)."""
     from sam3.model_builder import build_sam3_video_predictor
 
     sam3_instances = []
     for i in range(n_workers):
         sam3 = build_sam3_video_predictor()
         sam3.model.to(device)
-        # Give each instance its own session dict to avoid cross-thread interference
         sam3._ALL_INFERENCE_STATES = {}
         vram_gb = torch.cuda.memory_allocated(0) / 1e9
-        log.info(f"SAM3 instance {i} loaded, total VRAM used: {vram_gb:.1f}GB")
+        log.info(f"  SAM3 instance {i} loaded, VRAM: {vram_gb:.1f}GB")
         sam3_instances.append(sam3)
 
-    # Thread-safe DB writes
     db_lock = threading.Lock()
     shot_queue: Queue = Queue()
-    for s in remaining:
+    for s in shots_to_process:
         shot_queue.put(s)
 
     total_tracks = 0
     shots_done = 0
+    n_total = len(shots_to_process)
 
     def _worker(worker_id, sam3_inst):
         nonlocal total_tracks, shots_done
@@ -430,11 +400,13 @@ def run_stage2(
                     shots_done += 1
                     if shots_done % 50 == 0:
                         log.info(
-                            f"Stage 2: {shots_done}/{len(remaining)} shots, "
+                            f"  {pass_label}: {shots_done}/{n_total} shots, "
                             f"{total_tracks} tracks"
                         )
             except Exception:
-                log.exception(f"Worker {worker_id} error on shot {shot['shot_id']}")
+                log.exception(
+                    f"  {pass_label} worker {worker_id} error on shot {shot['shot_id']}"
+                )
                 with db_lock:
                     db.mark_progress(STAGE, str(shot["shot_id"]), "error")
 
@@ -446,10 +418,104 @@ def run_stage2(
             threads.append(t)
         for t in threads:
             t.join()
-        log.info(
-            f"Stage 2 complete: {shots_done}/{len(remaining)} shots, {total_tracks} tracks"
-        )
     finally:
         for inst in sam3_instances:
             inst.model.to("cpu")
         torch.cuda.empty_cache()
+
+    return shots_done, total_tracks
+
+
+def run_stage2(
+    db: AnalysisDB,
+    video_path: str,
+    audio_stream: int = 0,
+    device: str = "cuda",
+    store_masks: bool = True,
+    tracking_fps: float = 1.0,
+    masks_dir: str | None = None,
+):
+    shots = db.get_shots()
+    if not shots:
+        raise RuntimeError("Stage 2: no shots in DB — run stages 0-1 first")
+
+    progress = db.get_progress(STAGE)
+    remaining = [s for s in shots if progress.get(str(s["shot_id"])) != "done"]
+    if not remaining:
+        log.info("Stage 2: all shots already tracked, skipping")
+        return
+
+    vid_w, vid_h = _get_video_dimensions(video_path)
+    if masks_dir is None:
+        masks_dir = str(
+            db.db_file.parent / db.db_file.stem.replace(".analysis", ".masks")
+        )
+    Path(masks_dir).mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    total_vram = torch.cuda.get_device_properties(0).total_memory
+    n_workers = min(4, max(1, int((total_vram - 10 * 1024**3) / (10 * 1024**3))))
+
+    total_done = 0
+    total_tracks = 0
+
+    # --- Pass 1: parallel (fast, some failures expected) ---
+    if n_workers > 1:
+        log.info(
+            f"Stage 2 pass 1: {n_workers} workers for {len(remaining)} shots "
+            f"at {tracking_fps:.1f}fps"
+        )
+        done, tracks = _run_workers(
+            db,
+            video_path,
+            remaining,
+            n_workers,
+            device,
+            store_masks,
+            tracking_fps,
+            vid_w,
+            vid_h,
+            masks_dir,
+            "Pass 1",
+        )
+        total_done += done
+        total_tracks += tracks
+        log.info(f"Pass 1 done: {done}/{len(remaining)} shots, {tracks} tracks")
+
+        # Collect failures for retry
+        progress = db.get_progress(STAGE)
+        failed = [s for s in shots if progress.get(str(s["shot_id"])) == "error"]
+    else:
+        failed = remaining
+
+    # --- Pass 2: single worker retry (reliable) ---
+    if failed:
+        # Reset error status so they're retried
+        for s in failed:
+            db.mark_progress(STAGE, str(s["shot_id"]), "pending")
+
+        log.info(f"Stage 2 pass 2: 1 worker retrying {len(failed)} shots")
+        done, tracks = _run_workers(
+            db,
+            video_path,
+            failed,
+            1,
+            device,
+            store_masks,
+            tracking_fps,
+            vid_w,
+            vid_h,
+            masks_dir,
+            "Pass 2",
+        )
+        total_done += done
+        total_tracks += tracks
+        log.info(f"Pass 2 done: {done}/{len(failed)} shots, {tracks} tracks")
+
+    # Final report
+    progress = db.get_progress(STAGE)
+    still_failed = [s for s in shots if progress.get(str(s["shot_id"])) == "error"]
+    log.info(
+        f"Stage 2 complete: {total_done} shots processed, {total_tracks} tracks, "
+        f"{len(still_failed)} still failed"
+    )
